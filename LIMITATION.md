@@ -1,6 +1,3 @@
-
-
-```
 # Limitations & Threat Model
 
 torchain hardens your **network layer** by forcing all traffic through Tor and
@@ -75,12 +72,10 @@ above or below that layer:
 
 Protection is only real if you confirm it:
 
-```
-
+```shell
 torchain leaktest      # run after every start
 
 torchain status        # confirm firewall + tor are active
-
 ```
 
 Always verify your exit IP, DNS, and IPv6 with the built-in **Leak Test** (or an
@@ -95,4 +90,3 @@ independent service) before assuming you are protected.
 > your overall anonymity depends on your full threat model, your behavior, and
 > the applications you run. Understand that model and use torchain responsibly
 > and legally.
-```
