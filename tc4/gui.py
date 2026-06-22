@@ -225,6 +225,8 @@ class TorChainGUI:
         self.rotate_btn.pack(side="left", padx=SPACE["sm"])
         self.panic_btn = self._btn(row, "PANIC", self._do_panic, kind="danger")
         self.panic_btn.pack(side="left")
+        self.pandora_btn = self._btn(row, "PANDORA", self._do_pandora, kind="danger")
+        self.pandora_btn.pack(side="left", padx=SPACE["sm"])
 
         # Stat tiles
         tiles = tk.Frame(v, bg=P.bg)
@@ -295,6 +297,28 @@ class TorChainGUI:
         self._btn(inner, "SAVE SETTINGS", self._save_settings).pack(anchor="w",
                                                                     pady=SPACE["md"])
 
+        # --- Network recovery -----------------------------------------
+        rec = self._card(v, "Network Recovery")
+        rec.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["lg"]))
+        rinner = tk.Frame(rec, bg=P.surface)
+        rinner.pack(fill="x", padx=SPACE["md"], pady=SPACE["md"])
+        tk.Label(rinner,
+                 text=("Stuck offline after stopping torchain? Restore normal "
+                       "networking: clears torchain firewall rules, fixes DNS, "
+                       "and restarts your network services."),
+                 bg=P.surface, fg=P.text_dim, font=font(10), justify="left",
+                 wraplength=720, anchor="w").pack(fill="x")
+        self.repair_status = tk.Label(rinner, text="", bg=P.surface,
+                                      fg=P.text_dim, font=font(10), anchor="w",
+                                      justify="left", wraplength=720)
+        self.repair_status.pack(fill="x", pady=SPACE["xs"])
+        rrow = tk.Frame(rinner, bg=P.surface)
+        rrow.pack(fill="x", pady=SPACE["xs"])
+        self._btn(rrow, "REPAIR INTERNET",
+                  lambda: self._repair_to(self.repair_status)).pack(side="left")
+        self._btn(rrow, "PANDORA (WIPE + SCRUB)", self._do_pandora,
+                  kind="danger").pack(side="left", padx=SPACE["sm"])
+
     def _build_bridges(self):
         v = tk.Frame(self.content, bg=P.bg)
         self.views["bridges"] = v
@@ -349,6 +373,9 @@ class TorChainGUI:
         self._btn(r2, "STOP WATCHDOG", lambda: self._adv(self._stop_wd), kind="ghost").pack(side="left", padx=SPACE["sm"])
         r3 = tk.Frame(inner, bg=P.surface); r3.pack(fill="x", pady=SPACE["xs"])
         self._btn(r3, "SCAN FOR OLD VERSIONS", lambda: self._adv(self._scan_old), kind="ghost").pack(side="left")
+        r4 = tk.Frame(inner, bg=P.surface); r4.pack(fill="x", pady=SPACE["xs"])
+        self._btn(r4, "REPAIR INTERNET", lambda: self._repair_to(self.adv_status)).pack(side="left")
+        self._btn(r4, "PANDORA (WIPE + SCRUB)", self._do_pandora, kind="danger").pack(side="left", padx=SPACE["sm"])
 
     # -- bridge handlers --
     def _save_bridge_type(self):
@@ -556,8 +583,85 @@ class TorChainGUI:
         self._run_worker(engine.newnym, lambda r: self.sub_status.configure(
             text="New identity requested.", fg=P.ok))
 
+    def _authenticate_sudo(self, action_label: str) -> bool:
+        """Modal sudo-password gate shown before destructive actions.
+
+        The user explicitly wants PANIC/PANDORA to demand the sudo password.
+        We verify the entered password with ``sudo -S -k -v`` before letting
+        the action proceed. Returns True only on a successful authentication.
+        """
+        import subprocess
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Authentication required")
+        dlg.configure(bg=P.surface)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        tk.Label(dlg, text=action_label, bg=P.surface, fg=P.text,
+                 font=font(12, bold=True)).pack(anchor="w", padx=SPACE["lg"],
+                                                pady=(SPACE["lg"], 0))
+        tk.Label(dlg, text="Enter your sudo password to continue.",
+                 bg=P.surface, fg=P.text_dim, font=font(10)).pack(
+                     anchor="w", padx=SPACE["lg"], pady=(0, SPACE["sm"]))
+        pw_var = tk.StringVar()
+        ent = tk.Entry(dlg, textvariable=pw_var, show="•", bg=P.overlay,
+                       fg=P.text, insertbackground=P.text, relief="flat",
+                       font=font(11), width=34)
+        ent.pack(padx=SPACE["lg"], pady=SPACE["sm"])
+        ent.focus_set()
+        err = tk.Label(dlg, text="", bg=P.surface, fg=P.err, font=font(9))
+        err.pack(anchor="w", padx=SPACE["lg"])
+        result = {"ok": False}
+
+        def verify():
+            pw = pw_var.get()
+            try:
+                proc = subprocess.run(["sudo", "-S", "-k", "-v"],
+                                      input=pw + "\n", text=True,
+                                      capture_output=True, timeout=15)
+                if proc.returncode == 0:
+                    result["ok"] = True
+                    dlg.destroy()
+                else:
+                    err.configure(text="Incorrect password. Try again.")
+                    pw_var.set("")
+            except Exception as exc:  # noqa: BLE001
+                err.configure(text=f"Auth error: {exc}")
+
+        brow = tk.Frame(dlg, bg=P.surface)
+        brow.pack(fill="x", padx=SPACE["lg"], pady=SPACE["md"])
+        self._btn(brow, "AUTHENTICATE", verify, kind="danger").pack(side="left")
+        self._btn(brow, "CANCEL", dlg.destroy, kind="ghost").pack(
+            side="left", padx=SPACE["sm"])
+        ent.bind("<Return>", lambda e: verify())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.wait_window()
+        return result["ok"]
+
     def _do_panic(self):
+        if not self._authenticate_sudo("Engage PANIC kill-switch"):
+            return
         self._run_worker(engine.panic, lambda r: self._apply_status(engine.status()))
+
+    def _do_pandora(self):
+        if not self._authenticate_sudo("Detonate PANDORA (wipe + memory scrub)"):
+            return
+        self.sub_status.configure(text="PANDORA detonating…", fg=P.warn)
+        self._run_worker(engine.pandora, self._after_pandora)
+
+    def _after_pandora(self, msg):
+        self.sub_status.configure(
+            text="PANDORA detonated — state wiped, memory scrubbed. Use "
+                 "Repair Internet to restore networking.", fg=P.warn)
+        self._run_worker(engine.status, self._apply_status)
+
+    def _repair_to(self, label):
+        label.configure(text="Repairing internet…", fg=P.text_dim)
+        self._run_worker(
+            engine.repair_internet,
+            lambda r: label.configure(
+                text=("Done: " + r) if r else "Internet repaired.", fg=P.ok))
 
     def _refresh_circuits(self):
         def load():

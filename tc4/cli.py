@@ -84,6 +84,36 @@ def cmd_panic(args) -> int:
     return 0
 
 
+def cmd_repair(args) -> int:
+    msg = engine.repair_internet()
+    print(_c("\u2713", "green"), "internet repair complete")
+    for part in msg.split("; "):
+        if part:
+            print("  -", part)
+    return 0
+
+
+def cmd_pandora(args) -> int:
+    if not getattr(args, "yes", False):
+        sys.stderr.write(_c(
+            "PANDORA will block ALL traffic, securely wipe torchain state, "
+            "and scrub memory.\n", "amber"))
+        try:
+            ans = input("Type 'pandora' to confirm: ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans != "pandora":
+            print("aborted")
+            return 1
+    msg = engine.pandora()
+    print(_c("\u26a0", "amber"), "PANDORA detonated")
+    for part in msg.split("; "):
+        if part:
+            print("  -", part)
+    print("Run 'torchain repair' or 'torchain panic disarm' to restore networking.")
+    return 0
+
+
 def cmd_leaktest(args) -> int:
     from . import leaktest
     icons = {"pass": _c("PASS", "green"), "fail": _c("FAIL", "red"),
@@ -279,6 +309,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="run a pre-flight system check").set_defaults(fn=cmd_doctor)
     sub.add_parser("gui", help="launch the desktop dashboard").set_defaults(fn=cmd_gui)
+    sub.add_parser("repair", help="force-restore normal networking (fix internet)").set_defaults(fn=cmd_repair)
+
+    pd = sub.add_parser("pandora", help="kill-switch + wipe torchain state + scrub memory")
+    pd.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    pd.set_defaults(fn=cmd_pandora)
 
     br = sub.add_parser("bridge", help="manage bridges / pluggable transports")
     brs = br.add_subparsers(dest="bridge_cmd", required=True)

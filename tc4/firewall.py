@@ -104,14 +104,37 @@ def _block_ipv6() -> None:
     _ipt6("-P", "FORWARD", "DROP", check=False)
 
 
+def _del_all_jumps(table: str, chain: str) -> None:
+    """Delete *every* OUTPUT jump into ``chain`` (not just the first).
+
+    This is the core internet-cutoff fix: if more than one jump into the
+    fail-closed TORCHAIN_OUT chain existed (e.g. up() ran twice), deleting only
+    one left the DROP rule attached and ``-X`` failed because the chain was
+    still referenced - so the box stayed offline after ``stop``. We now remove
+    them all before flushing/deleting the chain.
+    """
+    base = ["iptables"] + (["-t", table] if table != "filter" else [])
+    rule = ["OUTPUT", "-j", chain]
+    for _ in range(64):  # defensive cap
+        if not run_ok(base + ["-C", *rule]):
+            break
+        if not run_ok(base + ["-D", *rule]):
+            break
+
+
 def down(cfg: Config, quiet: bool = False) -> None:
-    """Remove all torchain rules. Best-effort and always safe to call."""
-    # Detach from OUTPUT first, then flush+delete our chains.
-    run_ok(["iptables", "-t", "nat", "-D", "OUTPUT", "-j", "TORCHAIN"])
-    run_ok(["iptables", "-D", "OUTPUT", "-j", "TORCHAIN_OUT"])
-    for table, chain in (("nat", "TORCHAIN"), ("filter", "TORCHAIN_OUT")):
-        run_ok(["iptables", "-t", table, "-F", chain])
-        run_ok(["iptables", "-t", table, "-X", chain])
+    """Remove all torchain rules. Best-effort, idempotent, always safe to call.
+
+    Removes every OUTPUT jump (handling duplicates) so a leftover DROP can
+    never keep the machine offline, then flushes + deletes our chains and
+    restores permissive IPv6 policies.
+    """
+    if which("iptables"):
+        _del_all_jumps("nat", "TORCHAIN")
+        _del_all_jumps("filter", "TORCHAIN_OUT")
+        for table, chain in (("nat", "TORCHAIN"), ("filter", "TORCHAIN_OUT")):
+            run_ok(["iptables", "-t", table, "-F", chain])
+            run_ok(["iptables", "-t", table, "-X", chain])
     if which("ip6tables"):
         for pol in ("OUTPUT", "INPUT", "FORWARD"):
             run_ok(["ip6tables", "-P", pol, "ACCEPT"])
