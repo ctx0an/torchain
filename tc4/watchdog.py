@@ -127,7 +127,6 @@ def _handle_signal(signum, frame):
 
 def _run_loop() -> None:
     """The actual monitoring loop (runs in the daemon process)."""
-    global _STOP
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     # Import here so the daemon has a clean module state.

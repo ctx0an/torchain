@@ -43,7 +43,7 @@ fi
 info "removing torchain firewall chains..."
 if have iptables; then
   for spec in "nat TORCHAIN" "filter TORCHAIN_OUT"; do
-    set -- $spec; table="$1"; chain="$2"
+    set -- "$spec"; table="$1"; chain="$2"
     # delete every OUTPUT jump (handles duplicates that used to strand a DROP)
     while iptables -t "$table" -C OUTPUT -j "$chain" 2>/dev/null; do
       iptables -t "$table" -D OUTPUT -j "$chain" 2>/dev/null || break
@@ -73,7 +73,8 @@ if [ "$dns_broken" -eq 1 ]; then
   [ -f "$RESOLV" ] && [ ! -f "$RESOLV.torchain.bak" ] && cp -a "$RESOLV" "$RESOLV.torchain.bak" 2>/dev/null || true
   { echo "# restored by torchain internet.sh"
     for ns in "${FALLBACK_DNS[@]}"; do echo "nameserver $ns"; done
-  } > "$RESOLV" 2>/dev/null && ok "resolv.conf restored" || warn "could not rewrite resolv.conf"
+  } > "$RESOLV" 2>/dev/null
+  if [ $? -eq 0 ]; then ok "resolv.conf restored"; else warn "could not rewrite resolv.conf"; fi
 else
   ok "resolv.conf already valid"
 fi

@@ -36,7 +36,8 @@ install_deps() {
   local pkgs_apt="tor obfs4proxy iptables iproute2 python3 python3-tk xauth x11-xserver-utils polkitd pkexec"
   if command -v apt-get >/dev/null 2>&1; then
     info "installing dependencies via apt-get"
-    apt-get update -y && apt-get install -y $pkgs_apt || die "dependency install failed"
+    # shellcheck disable=SC2086
+    if apt-get update -y && apt-get install -y $pkgs_apt; then true; else die "dependency install failed"; fi
   elif command -v dnf >/dev/null 2>&1; then
     info "installing dependencies via dnf"
     dnf install -y tor obfs4 iptables iproute python3 python3-tkinter xorg-x11-xauth xorg-x11-server-utils polkit || die "dependency install failed"
@@ -111,7 +112,7 @@ EOF
 
   # 5) Validate the entry if the freedesktop tool is available.
   if command -v desktop-file-validate >/dev/null 2>&1; then
-    desktop-file-validate "$desktop" >/dev/null 2>&1 && ok "desktop entry installed and validated" || ok "desktop entry installed"
+    if desktop-file-validate "$desktop" >/dev/null 2>&1; then ok "desktop entry installed and validated"; else ok "desktop entry installed"; fi
   else
     ok "desktop entry installed (will appear in the application menu)"
   fi
