@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# TorChain runtime artifacts
+*.log
+*.log.*.gz
+torchain_orig_hostname
+*.bak
+*.tmp
+
+# Packaging / build output
+*.tar.gz
+dist/
+build/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

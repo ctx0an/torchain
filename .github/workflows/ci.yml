@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shell:
+    name: Shell (bash syntax + ShellCheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: |
+          bash -n torchain
+          bash -n setup.sh
+
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          additional_files: 'torchain'
+        env:
+          # SC1090/SC1091: dynamic 'source' paths are intentional.
+          # SC2129: grouped redirects are a style preference here.
+          SHELLCHECK_OPTS: -e SC1090 -e SC1091 -e SC2129
+
+  python:
+    name: Python (compile + lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Byte-compile all modules
+        run: python -m compileall -q .
+
+      - name: Lint (syntax-critical errors only)
+        run: |
+          python -m pip install --upgrade flake8
+          # Fail the build only on real errors (undefined names, syntax).
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics

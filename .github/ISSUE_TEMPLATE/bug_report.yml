@@ -1,0 +1,54 @@
+name: Bug Report
+description: Report a problem with TorChain
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to file a bug report! Please redact any sensitive data (real IPs, hostnames) from logs.
+  - type: input
+    id: version
+    attributes:
+      label: TorChain version
+      placeholder: output of `trc version` (e.g. 3.0.3)
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution & version
+      placeholder: e.g. Ubuntu 24.04, Arch, Fedora 40
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `trc ...`
+        2. ...
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Output of `trc doctor` and the tail of /var/log/torchain/torchain.log
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I ran `trc doctor` and included the output.
+          required: true
+        - label: I searched existing issues for duplicates.
+          required: true

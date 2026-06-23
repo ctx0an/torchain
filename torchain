@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+#
+# torchain - fast, system-wide Tor anonymizer (v5)
+#
+# Thin, robust launcher. All real logic lives in the `tc4` Python package so
+# the tool starts fast and uses very little memory. The launcher's jobs are:
+# locate the package, ensure python3, and make privilege handling FULLY
+# AUTOMATIC - every command that needs root (including the GUI) transparently
+# elevates.
+#
+# Launching a GUI as root from an application menu is the classic source of
+# 'Invalid MIT-MAGIC-COOKIE-1 key' / 'couldn't connect to display' crashes,
+# because root cannot reach the user's X server. We solve that properly:
+#   1) pkexec  -> a real graphical password prompt that works from a menu
+#   2) a hostname-wildcarded X cookie so root can actually open the display
+#   3) sudo with a graphical askpass as a fallback
+#   4) if all elevation fails, open UNPRIVILEGED instead of crashing
+#
+set -Eeuo pipefail
+
+# --- locate ourselves (resolve symlinks) -----------------------------------
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+APP_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+if [ ! -d "$APP_DIR/tc4" ] && [ -d "/usr/share/torchain/tc4" ]; then
+  APP_DIR="/usr/share/torchain"
+fi
+
+C_RED=$'\033[38;5;203m'; C_YEL=$'\033[38;5;215m'; C_RST=$'\033[0m'
+die() { echo "${C_RED}✗ $*${C_RST}" >&2; exit 1; }
+warn() { echo "${C_YEL}⚠ $*${C_RST}" >&2; }
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required but not installed."
+[ -d "$APP_DIR/tc4" ] || die "torchain package not found (looked in $APP_DIR)."
+
+PYBIN="$(command -v python3)"
+CMD="${1:-}"
+
+# --- which commands need root? (almost everything that touches the system) --
+NEEDS_ROOT=0
+case "$CMD" in
+  start|stop|restart|rotate|panic|watchdog|boot|migrate) NEEDS_ROOT=1 ;;
+  bridge) NEEDS_ROOT=1 ;;        # writes /etc/torchain + may reload tor
+  config) NEEDS_ROOT=1 ;;        # writes /etc/torchain
+  gui)    NEEDS_ROOT=1 ;;        # transparent proxying needs root
+  *)      NEEDS_ROOT=0 ;;
+esac
+
+run_elevated() {
+  # Re-run a non-GUI command as root. $@ = full argv.
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo -E PYTHONPATH="$APP_DIR" "$PYBIN" -m tc4 "$@"
+  elif command -v pkexec >/dev/null 2>&1; then
+    exec pkexec /usr/bin/env PYTHONPATH="$APP_DIR" "$PYBIN" -m tc4 "$@"
+  else
+    die "this command needs root and neither sudo nor pkexec is available."
+  fi
+}
+
+prepare_xauth() {
+  # Echo the path to a root-readable X authority file containing a
+  # hostname-wildcarded copy of the current user's cookie. This is the
+  # canonical fix for 'Invalid MIT-MAGIC-COOKIE-1 key' when running as root.
+  local disp="${DISPLAY:-:0}"
+  local src="${XAUTHORITY:-$HOME/.Xauthority}"
+  local xa
+  xa="$(mktemp "/tmp/torchain-xauth.XXXXXX" 2>/dev/null || echo "/tmp/torchain-xauth.$$")"
+  if command -v xauth >/dev/null 2>&1; then
+    if ! XAUTHORITY="$src" xauth nlist "$disp" 2>/dev/null \
+         | sed -e 's/^..../ffff/' \
+         | xauth -f "$xa" nmerge - >/dev/null 2>&1; then
+      cp -f "$src" "$xa" 2>/dev/null || true
+    fi
+  else
+    cp -f "$src" "$xa" 2>/dev/null || true
+  fi
+  chmod 0644 "$xa" 2>/dev/null || true
+  echo "$xa"
+}
+
+run_gui_elevated() {
+  local disp="${DISPLAY:-:0}"
+  if [ -z "${DISPLAY:-}" ]; then
+    warn "no DISPLAY detected; the dashboard needs a graphical session."
+  fi
+  local xa; xa="$(prepare_xauth)"
+  # Belt-and-suspenders: also allow the root user on this X server.
+  command -v xhost >/dev/null 2>&1 && xhost +SI:localuser:root >/dev/null 2>&1 || true
+
+  # 1) pkexec: a true graphical prompt that works when launched from a menu.
+  if command -v pkexec >/dev/null 2>&1; then
+    exec pkexec /usr/bin/env DISPLAY="$disp" XAUTHORITY="$xa" \
+      PYTHONPATH="$APP_DIR" "$PYBIN" -m tc4 gui
+  fi
+
+  # 2) sudo: direct if we have a terminal, else via a graphical askpass.
+  if command -v sudo >/dev/null 2>&1; then
+    if [ -t 0 ]; then
+      exec sudo -E DISPLAY="$disp" XAUTHORITY="$xa" \
+        PYTHONPATH="$APP_DIR" "$PYBIN" -m tc4 gui
+    fi
+    if [ -z "${SUDO_ASKPASS:-}" ]; then
+      for a in /usr/bin/ssh-askpass /usr/bin/lxqt-openssh-askpass \
+               /usr/bin/ksshaskpass /usr/lib/ssh/x11-ssh-askpass \
+               /usr/libexec/openssh/ssh-askpass; do
+        [ -x "$a" ] && export SUDO_ASKPASS="$a" && break
+      done
+    fi
+    if [ -n "${SUDO_ASKPASS:-}" ]; then
+      exec sudo -A -E DISPLAY="$disp" XAUTHORITY="$xa" \
+        PYTHONPATH="$APP_DIR" "$PYBIN" -m tc4 gui
+    fi
+  fi
+
+  # 3) Last resort: open unprivileged so the window still appears instead of
+  #    crashing. Privileged actions will report they need root.
+  warn "could not elevate the dashboard; opening unprivileged."
+  warn "to enable protection, run: sudo torchain start"
+  export PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  exec "$PYBIN" -m tc4 gui
+}
+
+if [ "$NEEDS_ROOT" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+  if [ "$CMD" = "gui" ]; then
+    run_gui_elevated
+  fi
+  run_elevated "$@"
+fi
+
+export PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PYBIN" -m tc4 "$@"
