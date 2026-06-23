@@ -71,10 +71,13 @@ if [ -f "$RESOLV" ]; then
 fi
 if [ "$dns_broken" -eq 1 ]; then
   [ -f "$RESOLV" ] && [ ! -f "$RESOLV.torchain.bak" ] && cp -a "$RESOLV" "$RESOLV.torchain.bak" 2>/dev/null || true
-  { echo "# restored by torchain internet.sh"
-    for ns in "${FALLBACK_DNS[@]}"; do echo "nameserver $ns"; done
-  } > "$RESOLV" 2>/dev/null
-  if [ $? -eq 0 ]; then ok "resolv.conf restored"; else warn "could not rewrite resolv.conf"; fi
+  if { echo "# restored by torchain internet.sh"
+       for ns in "${FALLBACK_DNS[@]}"; do echo "nameserver $ns"; done
+     } > "$RESOLV" 2>/dev/null; then
+    ok "resolv.conf restored"
+  else
+    warn "could not rewrite resolv.conf"
+  fi
 else
   ok "resolv.conf already valid"
 fi
