@@ -13,6 +13,16 @@ class TorchainApp : Application() {
         Logger.init(this)
         Logger.i("TorchainApp", "Torchain starting (v${BuildConfig.VERSION_NAME})")
         createNotificationChannels()
+        preloadNativeLibraries()
+    }
+
+    private fun preloadNativeLibraries() {
+        try {
+            System.loadLibrary("hev-socks5-tunnel")
+            Logger.i("TorchainApp", "hev-socks5-tunnel native library loaded")
+        } catch (t: Throwable) {
+            Logger.w("TorchainApp", "hev-socks5-tunnel native library not available: ${t.message}")
+        }
     }
 
     private fun createNotificationChannels() {

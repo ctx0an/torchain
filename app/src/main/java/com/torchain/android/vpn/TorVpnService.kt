@@ -90,9 +90,21 @@ class TorVpnService : VpnService() {
             file.writeText(conf)
             Logger.i("vpn", "tproxy.conf written to ${file.absolutePath}")
 
-            Logger.i("vpn", "Starting TProxy native library (hev-socks5-tunnel)...")
-            hev.sockstun.TProxyService.TProxyStartService(file.absolutePath, pfd.fd)
-            Logger.i("vpn", "TProxyService started with fd ${pfd.fd} — VPN is now active")
+            Logger.i("vpn", "Starting TProxy native library background thread...")
+            Thread({
+                try {
+                    Logger.i("vpn-tproxy", "Calling TProxyStartService...")
+                    hev.sockstun.TProxyService.TProxyStartService(file.absolutePath, pfd.fd)
+                    Logger.i("vpn-tproxy", "TProxyStartService returned normally")
+                } catch (t: Throwable) {
+                    Logger.e("vpn-tproxy", "TProxyStartService failed (native error): ${t.message}", 
+                        if (t is Exception) t else null)
+                }
+            }, "tproxy-worker").apply {
+                isDaemon = true
+                start()
+            }
+            Logger.i("vpn", "TProxy worker thread dispatched")
 
         } catch (e: java.lang.SecurityException) {
             Logger.e("vpn", "VPN permission denied: ${e.message}", e)
@@ -112,8 +124,9 @@ class TorVpnService : VpnService() {
         try {
             hev.sockstun.TProxyService.TProxyStopService()
             Logger.i("vpn", "TProxyService stopped")
-        } catch (e: Exception) {
-            Logger.e("vpn", "TProxyStopService failed", e)
+        } catch (t: Throwable) {
+            Logger.e("vpn", "TProxyStopService failed", 
+                if (t is Exception) t else Exception(t.message))
         }
         try { tunFd?.close() } catch (_: Exception) {}
         tunFd = null
@@ -126,8 +139,9 @@ class TorVpnService : VpnService() {
         running = false
         try {
             hev.sockstun.TProxyService.TProxyStopService()
-        } catch (e: Exception) {
-            Logger.e("vpn", "TProxyStopService failed on revoke", e)
+        } catch (t: Throwable) {
+            Logger.e("vpn", "TProxyStopService failed on revoke", 
+                if (t is Exception) t else Exception(t.message))
         }
         try { tunFd?.close() } catch (_: Exception) {}
         stopSelf()
