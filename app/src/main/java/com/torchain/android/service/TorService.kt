@@ -27,6 +27,7 @@ class TorService : LifecycleService() {
 
     private lateinit var tor: TorController
     private var statusJob: Job? = null
+    @Volatile private var proxyMode: String = "vpn"
 
     override fun onCreate() {
         super.onCreate()
@@ -58,30 +59,40 @@ class TorService : LifecycleService() {
     private fun startTor() {
         lifecycleScope.launch {
             val config = Config.flow(this@TorService).first()
-            Logger.i("TorService", "Starting Tor with config: exitCountry=${config.exitCountry} blockIpv6=${config.blockIpv6} bridges=${config.bridgesEnabled}")
+            proxyMode = config.proxyMode
+            Logger.i("TorService", "Starting Tor with config: exitCountry=${config.exitCountry} blockIpv6=${config.blockIpv6} bridges=${config.bridgesEnabled} proxyMode=${config.proxyMode}")
             val ok = tor.start(config)
             if (ok) {
-                Logger.i("TorService", "Tor process launched, starting VPN service...")
-                val vpnIntent = Intent(this@TorService, com.torchain.android.vpn.TorVpnService::class.java)
-                try {
-                    startService(vpnIntent)
-                    Logger.i("TorService", "TorVpnService startService() called")
-                } catch (e: Exception) {
-                    Logger.e("TorService", "Failed to start TorVpnService: ${e.message}", e)
+                if (config.proxyMode == "vpn") {
+                    Logger.i("TorService", "Tor process launched, starting VPN service...")
+                    val vpnIntent = Intent(this@TorService, com.torchain.android.vpn.TorVpnService::class.java)
+                    try {
+                        startService(vpnIntent)
+                        Logger.i("TorService", "TorVpnService startService() called")
+                    } catch (e: Exception) {
+                        Logger.e("TorService", "Failed to start TorVpnService: ${e.message}", e)
+                    }
+                } else {
+                    Logger.i("TorService", "SOCKS5 mode — VPN service skipped, SOCKS5 proxy on port 9050")
                 }
             } else {
-                Logger.e("TorService", "Tor.start() returned false — VPN will not start")
+                Logger.e("TorService", "Tor.start() returned false — service will not start")
             }
         }
     }
 
     private fun stopTor() {
         lifecycleScope.launch {
+            val config = Config.flow(this@TorService).first()
             Logger.i("TorService", "Stopping Tor and VPN...")
-            try {
-                stopService(Intent(this@TorService, com.torchain.android.vpn.TorVpnService::class.java))
-                Logger.i("TorService", "VPN service stop requested")
-            } catch (e: Exception) { Logger.w("TorService", "stop vpn failed", e) }
+            if (config.proxyMode == "vpn") {
+                try {
+                    stopService(Intent(this@TorService, com.torchain.android.vpn.TorVpnService::class.java))
+                    Logger.i("TorService", "VPN service stop requested")
+                } catch (e: Exception) { Logger.w("TorService", "stop vpn failed", e) }
+            } else {
+                Logger.i("TorService", "SOCKS5 mode — no VPN service to stop")
+            }
             tor.stop()
             Logger.i("TorService", "Tor stopped")
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -90,13 +101,14 @@ class TorService : LifecycleService() {
     }
 
     private fun updateNotification(s: TorStatus) {
+        val modeTag = if (proxyMode == "socks5") " [SOCKS5]" else ""
         val msg = when (val st = s.state) {
-            is TorState.Stopped -> "Stopped"
-            is TorState.Starting -> "Starting..."
-            is TorState.Bootstrapping -> "Bootstrap ${st.progress}% - ${st.tag}"
-            is TorState.Running -> "Running - exit ${s.exitIp.ifEmpty { "..." }}"
-            is TorState.Stopping -> "Stopping..."
-            is TorState.Error -> "Error: ${st.message.take(80)}"
+            is TorState.Stopped -> "Stopped$modeTag"
+            is TorState.Starting -> "Starting...$modeTag"
+            is TorState.Bootstrapping -> "Bootstrap ${st.progress}% - ${st.tag}$modeTag"
+            is TorState.Running -> "Running - exit ${s.exitIp.ifEmpty { "..." }}$modeTag"
+            is TorState.Stopping -> "Stopping...$modeTag"
+            is TorState.Error -> "Error: ${st.message.take(80)}$modeTag"
         }
         val nm = getSystemService(NotificationManager::class.java) ?: return
         nm.notify(NOTIF_ID, buildNotification(msg))

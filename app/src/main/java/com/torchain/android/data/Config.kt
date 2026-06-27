@@ -22,7 +22,8 @@ data class TorchainConfig(
     val startOnBoot: Boolean = false,
     val bridgesEnabled: Boolean = false,
     val bridgeTransport: String = "vanilla",
-    val bridgeLines: List<String> = emptyList()
+    val bridgeLines: List<String> = emptyList(),
+    val proxyMode: String = "vpn" // "vpn" or "socks5"
 )
 
 object Config {
@@ -37,6 +38,7 @@ object Config {
         val BRIDGES_ENABLED = booleanPreferencesKey("bridges_enabled")
         val BRIDGE_TRANSPORT = stringPreferencesKey("bridge_transport")
         val BRIDGE_LINES = stringPreferencesKey("bridge_lines")
+        val PROXY_MODE = stringPreferencesKey("proxy_mode")
     }
 
     fun flow(ctx: Context): Flow<TorchainConfig> = ctx.dataStore.data.map { it.toConfig() }
@@ -54,6 +56,7 @@ object Config {
             prefs[Keys.BRIDGES_ENABLED] = updated.bridgesEnabled
             prefs[Keys.BRIDGE_TRANSPORT] = updated.bridgeTransport
             prefs[Keys.BRIDGE_LINES] = updated.bridgeLines.joinToString("\n")
+            prefs[Keys.PROXY_MODE] = updated.proxyMode
         }
     }
 
@@ -67,6 +70,7 @@ object Config {
         startOnBoot = this[Keys.START_ON_BOOT] ?: false,
         bridgesEnabled = this[Keys.BRIDGES_ENABLED] ?: false,
         bridgeTransport = this[Keys.BRIDGE_TRANSPORT] ?: "vanilla",
-        bridgeLines = (this[Keys.BRIDGE_LINES] ?: "").split('\n').filter { it.isNotBlank() }
+        bridgeLines = (this[Keys.BRIDGE_LINES] ?: "").split('\n').filter { it.isNotBlank() },
+        proxyMode = this[Keys.PROXY_MODE] ?: "vpn"
     )
 }

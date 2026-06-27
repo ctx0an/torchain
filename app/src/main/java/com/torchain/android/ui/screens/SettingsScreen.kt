@@ -115,6 +115,11 @@ fun SettingsScreen() {
                 modifier = Modifier.padding(horizontal = 8.dp).fillMaxWidth(0.6f)
             )
         }
+        SettingToggle("SOCKS5 proxy mode (no VPN)",
+            "Skip VPN — SOCKS5 proxy on 127.0.0.1:9050 for manual use",
+            cfg.proxyMode == "socks5") { v ->
+            scope.launch { Config.set(context) { it.copy(proxyMode = if (v) "socks5" else "vpn") } }
+        }
         SettingToggle("Start on boot",
             "Launch Tor automatically when the device boots",
             cfg.startOnBoot) { v ->

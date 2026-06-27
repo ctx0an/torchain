@@ -32,7 +32,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.torchain.android.data.Config
 import com.torchain.android.data.TorState
+import com.torchain.android.data.TorchainConfig
 import com.torchain.android.service.TorService
 import com.torchain.android.ui.components.BootstrapBar
 import com.torchain.android.ui.components.PillStatus
@@ -54,6 +56,8 @@ import com.torchain.android.util.TorStatusBus
 fun DashboardScreen() {
     val context = LocalContext.current
     val status by TorStatusBus.status.collectAsState()
+    val cfg by Config.flow(context).collectAsState(initial = TorchainConfig())
+    val isSocks5 = cfg.proxyMode == "socks5"
 
     val vpnLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -83,7 +87,9 @@ fun DashboardScreen() {
         ) {
             Column {
                 Text("Dashboard", style = MaterialTheme.typography.headlineMedium)
-                Text("Route every packet through Tor",
+                Text(
+                    if (isSocks5) "SOCKS5 proxy mode (no VPN)"
+                    else "Route every packet through Tor",
                     style = MaterialTheme.typography.bodyMedium,
                     color = KaliTextSecondary)
             }
@@ -102,6 +108,8 @@ fun DashboardScreen() {
             onClick = {
                 if (isRunning) {
                     TorService.stop(context)
+                } else if (isSocks5) {
+                    TorService.start(context)
                 } else {
                     val prep = VpnService.prepare(context)
                     if (prep != null) vpnLauncher.launch(prep)
@@ -210,7 +218,7 @@ fun DashboardScreen() {
                 value = if (isRunning) "127.0.0.1:${status.socksPort}" else "\u2014",
                 modifier = Modifier.weight(1f))
             StatTile(
-                label = "VPN",
+                label = if (isSocks5) "PROXY" else "VPN",
                 value = if (isRunning) "UP" else "DOWN",
                 modifier = Modifier.weight(1f),
                 accent = if (isRunning) KaliSuccess else KaliTextSecondary)
