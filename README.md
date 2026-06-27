@@ -8,6 +8,9 @@
 
 <img src="docs/torchain-icon.png" alt="torchain" width="64" height="64">
 
+[![Build Android APK](https://github.com/ctx0an/Torchain/actions/workflows/build-apk.yml/badge.svg)](https://github.com/ctx0an/Torchain/actions/workflows/build-apk.yml)
+[![CI Status](https://github.com/ctx0an/Torchain/actions/workflows/ci.yml/badge.svg)](https://github.com/ctx0an/Torchain/actions/workflows/ci.yml)
+
 </div>
 
 ---
