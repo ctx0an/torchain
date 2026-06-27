@@ -144,7 +144,7 @@ class TorController(private val context: Context) {
             control = ControlPortClient("127.0.0.1", controlPort, cookie).also {
                 it.setEventListener(::onEvent)
                 it.connect()
-                it.setEvents("STATUS_CLIENT", "STATUS_BOOTSTRAP", "BW", "CIRC", "NOTICE", "WARN", "ERR")
+                it.setEvents("STATUS_CLIENT", "BW", "CIRC", "NOTICE", "WARN", "ERR")
             }
 
             _status.value = _status.value.copy(

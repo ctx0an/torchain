@@ -18,9 +18,9 @@ if ! curl -sSL --fail --max-time 180 -o "$TMP/orbot.apk" "$ORBOT_URL"; then
 fi
 echo "    downloaded: $(du -h "$TMP/orbot.apk" | cut -f1)"
 
-echo "==> Extracting libtor.so + geoip databases..."
+echo "==> Extracting libtor.so + libhev-socks5-tunnel.so + geoip databases..."
 cd "$TMP"
-unzip -o -q orbot.apk 'lib/*/libtor.so' 'assets/geoip' 'assets/geoip6' || {
+unzip -o -q orbot.apk 'lib/*/libtor.so' 'lib/*/libhev-socks5-tunnel.so' 'assets/geoip' 'assets/geoip6' || {
   echo "unzip failed" >&2; exit 1
 }
 
@@ -31,6 +31,14 @@ for abi in "${ABIS[@]}"; do
     echo "  -> $abi/libtor.so  ($(du -h "$JNIDIR/$abi/libtor.so" | cut -f1))"
   else
     echo "  ! $abi: libtor.so not found in Orbot APK" >&2
+  fi
+  
+  src_tunnel="lib/$abi/libhev-socks5-tunnel.so"
+  if [[ -f "$src_tunnel" ]]; then
+    cp "$src_tunnel" "$JNIDIR/$abi/libhev-socks5-tunnel.so"
+    echo "  -> $abi/libhev-socks5-tunnel.so  ($(du -h "$JNIDIR/$abi/libhev-socks5-tunnel.so" | cut -f1))"
+  else
+    echo "  ! $abi: libhev-socks5-tunnel.so not found in Orbot APK" >&2
   fi
 done
 

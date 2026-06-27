@@ -28,6 +28,7 @@ build/
 # Native libs (downloaded by scripts/download_tor.sh)
 /app/src/main/jniLibs/*/libtor.so
 /app/src/main/jniLibs/*/liblyrebird.so
+/app/src/main/jniLibs/*/libhev-socks5-tunnel.so
 /app/src/main/assets/geoip*
 
 # Editor / OS
