@@ -64,6 +64,12 @@ fun DashboardScreen() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             TorService.start(context)
+        } else {
+            android.widget.Toast.makeText(
+                context,
+                "VPN permission is required to secure your traffic through Tor",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
         }
     }
 

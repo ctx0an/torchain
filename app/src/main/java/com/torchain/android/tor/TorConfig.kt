@@ -10,20 +10,20 @@ object TorConfig {
         socksPort: Int = 9050,
         controlPort: Int = 9051,
         dnsPort: Int = 5400,
-        transports: File? = null,
+        ptPorts: Map<String, Int> = emptyMap(),
         geoipFile: File? = null,
         geoip6File: File? = null
     ): File {
         dataDir.mkdirs()
         val torrc = File(dataDir, "torrc")
         val lines = build(config, dataDir, socksPort, controlPort, dnsPort,
-                          transports, geoipFile, geoip6File)
+                          ptPorts, geoipFile, geoip6File)
         torrc.writeText(lines.joinToString("\n") + "\n")
         return torrc
     }
 
     private fun build(c: TorchainConfig, dataDir: File, socksPort: Int,
-        controlPort: Int, dnsPort: Int, transports: File?,
+        controlPort: Int, dnsPort: Int, ptPorts: Map<String, Int>,
         geoipFile: File?, geoip6File: File?): List<String> = buildList {
         add("# Torchain torrc - generated")
         add("DataDirectory ${dataDir.absolutePath}")
@@ -57,12 +57,14 @@ object TorConfig {
         if (c.bridgesEnabled && c.bridgeTransport != "vanilla") {
             add("UseBridges 1")
             val t = c.bridgeTransport
+            val tpName = if (t == "snowflake") "snowflake" else if (t == "custom") "obfs4" else t
+            val ptPort = ptPorts[tpName]
+            if (ptPort != null && ptPort > 0) {
+                add("ClientTransportPlugin $tpName socks5 127.0.0.1:$ptPort")
+            }
             if (t == "snowflake") {
-                transports?.let { add("ClientTransportPlugin snowflake exec ${it.absolutePath}") }
-                add("Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://1098762253-1574206242 colo=12d")
+                add("Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://snowflake-broker.torproject.net/ front=ajax.aspnetcdn.com ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.bluesip.net:3478")
             } else {
-                val tpName = if (t == "custom") "obfs4" else t
-                transports?.let { add("ClientTransportPlugin $tpName exec ${it.absolutePath}") }
                 c.bridgeLines.forEach { line -> if (line.isNotBlank()) add("Bridge $line") }
             }
         }

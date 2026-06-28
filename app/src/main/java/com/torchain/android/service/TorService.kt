@@ -37,6 +37,16 @@ class TorService : LifecycleService() {
             tor.status.collectLatest { s ->
                 updateNotification(s)
                 broadcastState(s)
+                if (s.state is TorState.Error) {
+                    if (proxyMode == "vpn") {
+                        try {
+                            stopService(Intent(this@TorService, com.torchain.android.vpn.TorVpnService::class.java))
+                            Logger.i("TorService", "Tor error detected, stopped TorVpnService")
+                        } catch (e: Exception) {
+                            Logger.w("TorService", "Failed to stop VPN on Tor error", e)
+                        }
+                    }
+                }
             }
         }
     }

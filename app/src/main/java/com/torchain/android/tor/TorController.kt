@@ -1,6 +1,7 @@
 package com.torchain.android.tor
 
 import android.content.Context
+import android.os.Build
 import com.torchain.android.data.CircuitHop
 import com.torchain.android.data.CircuitInfo
 import com.torchain.android.data.TorState
@@ -11,13 +12,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.concurrent.atomic.AtomicReference
 
 class TorController(private val context: Context) {
 
@@ -90,10 +89,27 @@ class TorController(private val context: Context) {
             val cookie = File(dataDir, "control_auth_cookie")
             if (cookie.exists()) cookie.delete()
 
+            // Handle pluggable transports via IPtProxy
+            val ptPorts = mutableMapOf<String, Int>()
+            if (config.bridgesEnabled && config.bridgeTransport != "vanilla") {
+                val t = config.bridgeTransport
+                val tpName = if (t == "snowflake") "snowflake" else if (t == "custom") "obfs4" else t
+                val port = startPluggableTransport(tpName)
+                if (port > 0) {
+                    ptPorts[tpName] = port
+                } else {
+                    val msg = "Failed to start pluggable transport: $tpName. Aborting Tor start."
+                    Logger.e("tor", msg)
+                    _status.value = _status.value.copy(
+                        state = TorState.Error(msg), message = msg)
+                    return@withContext false
+                }
+            }
+
             val torrc = TorConfig.write(
                 dataDir = dataDir,
                 config = config,
-                transports = locateTransportBinary(),
+                ptPorts = ptPorts,
                 geoipFile = locateGeoip(),
                 geoip6File = locateGeoip6()
             )
@@ -123,17 +139,51 @@ class TorController(private val context: Context) {
                 redirectErrorStream(true)
                 directory(context.filesDir)
             }
-            process = pb.start()
+            val proc = pb.start()
+            process = proc
+            torRunning = true
 
+            // Populate PID in TorStatus
+            val pid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                proc.pid().toInt()
+            } else {
+                0
+            }
+            _status.value = _status.value.copy(pid = pid)
+            Logger.i("tor", "Tor process launched with PID $pid")
+
+            // Process stdout pump
             Thread({
                 try {
-                    process?.inputStream?.bufferedReader()?.forEachLine { line ->
+                    proc.inputStream.bufferedReader().forEachLine { line ->
                         Logger.i("tor-stdout", line)
                     }
                 } catch (e: Exception) {
                     Logger.w("tor-stdout", "stdout pump died", e)
                 }
             }, "tor-stdout").start()
+
+            // Dead-process detection: watcher thread to monitor Tor process exit
+            Thread({
+                try {
+                    val exitCode = proc.waitFor()
+                    if (torRunning) {
+                        val msg = "Tor process exited unexpectedly with code $exitCode"
+                        Logger.e("tor", msg)
+                        _status.value = _status.value.copy(
+                            state = TorState.Error(msg),
+                            message = msg,
+                            pid = 0
+                        )
+                        // Trigger clean teardown
+                        kotlinx.coroutines.runBlocking { stopInternal() }
+                    }
+                } catch (e: InterruptedException) {
+                    // Normal shutdown
+                } catch (e: Exception) {
+                    Logger.e("tor", "Error in Tor process watcher", e)
+                }
+            }, "tor-watcher").start()
 
             if (!waitForControlPort(controlPort, 20000)) {
                 val msg = "Tor control port ($controlPort) did not come up within 20s"
@@ -173,6 +223,35 @@ class TorController(private val context: Context) {
             )
             stopInternal()
             false
+        }
+    }
+
+    private fun startPluggableTransport(transport: String): Int {
+        try {
+            val stateDir = context.cacheDir.resolve("pt").apply { mkdirs() }
+            IPtProxy.IPtProxy.setStateLocation(stateDir.absolutePath)
+            
+            return when (transport) {
+                "obfs4" -> {
+                    Logger.i("tor-pt", "Starting obfs4 via IPtProxy...")
+                    val port = IPtProxy.IPtProxy.startObfs4(false, false)
+                    Logger.i("tor-pt", "obfs4 started on port $port")
+                    port
+                }
+                "snowflake" -> {
+                    Logger.i("tor-pt", "Starting snowflake via IPtProxy...")
+                    val ice = "stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.bluesip.net:3478"
+                    val broker = "https://snowflake-broker.torproject.net/"
+                    val front = "ajax.aspnetcdn.com"
+                    val port = IPtProxy.IPtProxy.startSnowflake(ice, broker, front, "", false, false)
+                    Logger.i("tor-pt", "snowflake started on port $port")
+                    port
+                }
+                else -> 0
+            }
+        } catch (e: Exception) {
+            Logger.e("tor-pt", "Failed to start pluggable transport $transport", e)
+            return 0
         }
     }
 
@@ -253,12 +332,17 @@ class TorController(private val context: Context) {
     private fun queryExitIpAsync() {
         Thread({
             try {
-                val ctl = control ?: return@Thread
-                val info = runBlocking { ctl.getInfo("address") }
-                val ip = info["address"] ?: ""
+                Logger.i("tor", "Querying exit IP over Tor SOCKS proxy...")
+                val url = java.net.URL("https://api.ipify.org")
+                val proxy = java.net.Proxy(java.net.Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", 9050))
+                val con = url.openConnection(proxy) as java.net.HttpURLConnection
+                con.connectTimeout = 15000
+                con.readTimeout = 15000
+                val ip = con.inputStream.bufferedReader().use { it.readText().trim() }
+                Logger.i("tor", "Exit IP queried successfully: $ip")
                 _status.value = _status.value.copy(exitIp = ip)
             } catch (e: Exception) {
-                Logger.w("tor", "exit ip query failed", e)
+                Logger.w("tor", "Exit IP query failed: ${e.message}")
             }
         }, "tor-exitip").start()
     }
@@ -310,14 +394,39 @@ class TorController(private val context: Context) {
         }
     }
 
-    suspend fun stop(): Boolean = withContext(Dispatchers.IO) { stopInternal(); true }
+    suspend fun stop(): Boolean = withContext(Dispatchers.IO) {
+        stopInternal()
+        true
+    }
 
-    private fun stopInternal() {
-        _status.value = _status.value.copy(state = TorState.Stopping, message = "Stopping...")
-        try { control?.let { runBlocking { it.close() } } }
-        catch (e: Exception) { Logger.w("tor", "control close failed", e) }
-        control = null
+    private suspend fun stopInternal() = withContext(Dispatchers.IO) {
+        if (!torRunning) return@withContext
         torRunning = false
+        _status.value = _status.value.copy(state = TorState.Stopping, message = "Stopping...")
+        
+        try {
+            control?.close()
+        } catch (e: Exception) {
+            Logger.w("tor", "control close failed", e)
+        }
+        control = null
+
+        // Stop pluggable transports
+        try {
+            IPtProxy.IPtProxy.stopObfs4()
+            IPtProxy.IPtProxy.stopSnowflake()
+            Logger.i("tor-pt", "Pluggable transports stopped")
+        } catch (e: Exception) {
+            Logger.w("tor-pt", "Failed to stop pluggable transports", e)
+        }
+
+        try {
+            process?.destroy()
+        } catch (e: Exception) {
+            Logger.w("tor", "Failed to destroy Tor process", e)
+        }
+        process = null
+        
         _status.value = TorStatus()
     }
 

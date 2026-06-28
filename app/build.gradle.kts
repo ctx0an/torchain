@@ -62,4 +62,32 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.json:json:20240303")
+    implementation("com.netzarchitekten:IPtProxy:3.8.1")
 }
+
+tasks.register("assertNativeLibsExist") {
+    doLast {
+        val jniLibsDir = file("src/main/jniLibs")
+        val abis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+        val requiredLibs = listOf("libtor.so", "libhev-socks5-tunnel.so")
+        
+        for (abi in abis) {
+            val abiDir = File(jniLibsDir, abi)
+            for (lib in requiredLibs) {
+                val libFile = File(abiDir, lib)
+                if (!libFile.exists()) {
+                    throw GradleException(
+                        "Required native library $lib is missing for ABI $abi in $abiDir. " +
+                        "Please run ./scripts/download_tor.sh before building."
+                    )
+                }
+            }
+        }
+        println("assertNativeLibsExist: All required native libraries are present.")
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn("assertNativeLibsExist")
+}
+

@@ -24,13 +24,15 @@ unzip -o -q orbot.apk 'lib/*/libtor.so' 'lib/*/libhev-socks5-tunnel.so' 'assets/
   echo "unzip failed" >&2; exit 1
 }
 
+MISSING=0
 for abi in "${ABIS[@]}"; do
   src="lib/$abi/libtor.so"
   if [[ -f "$src" ]]; then
     cp "$src" "$JNIDIR/$abi/libtor.so"
     echo "  -> $abi/libtor.so  ($(du -h "$JNIDIR/$abi/libtor.so" | cut -f1))"
   else
-    echo "  ! $abi: libtor.so not found in Orbot APK" >&2
+    echo "  ! ERROR: $abi: libtor.so not found in Orbot APK" >&2
+    MISSING=1
   fi
   
   src_tunnel="lib/$abi/libhev-socks5-tunnel.so"
@@ -38,9 +40,15 @@ for abi in "${ABIS[@]}"; do
     cp "$src_tunnel" "$JNIDIR/$abi/libhev-socks5-tunnel.so"
     echo "  -> $abi/libhev-socks5-tunnel.so  ($(du -h "$JNIDIR/$abi/libhev-socks5-tunnel.so" | cut -f1))"
   else
-    echo "  ! $abi: libhev-socks5-tunnel.so not found in Orbot APK" >&2
+    echo "  ! ERROR: $abi: libhev-socks5-tunnel.so not found in Orbot APK" >&2
+    MISSING=1
   fi
 done
+
+if [ $MISSING -ne 0 ]; then
+  echo "==> ERROR: Some required native libraries are missing. Cannot proceed." >&2
+  exit 1
+fi
 
 if [[ -f "assets/geoip" ]]; then
   cp assets/geoip "$ASSETS/geoip"

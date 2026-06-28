@@ -24,41 +24,81 @@ object BridgeManager {
 
     suspend fun fetch(transport: BridgeTransport): List<String> = withContext(Dispatchers.IO) {
         try {
-            val url = URL("https://bridges.torproject.org/moat/circumvention/options")
+            // Using the correct builtin endpoint instead of the non-existent options endpoint
+            val url = URL("https://bridges.torproject.org/moat/circumvention/builtin")
             val con = url.openConnection() as HttpsURLConnection
-            con.requestMethod = "POST"
-            con.setRequestProperty("Content-Type", "application/vnd.api+json")
+            con.requestMethod = "GET"
             con.setRequestProperty("Accept", "application/vnd.api+json")
-            con.doOutput = true
             con.connectTimeout = 15000
             con.readTimeout = 20000
-            val tp = when (transport) {
+            
+            if (con.responseCode !in 200..299) {
+                Logger.w("bridge-fetch", "Moat API returned HTTP ${con.responseCode} for builtin bridges")
+                throw IOException("Moat HTTP ${con.responseCode}")
+            }
+            
+            val resp = con.inputStream.bufferedReader().readText()
+            val lines = mutableListOf<String>()
+            
+            // Map our transport enum to Moat API key
+            val key = when (transport) {
                 BridgeTransport.OBFS4 -> "obfs4"
                 BridgeTransport.WEBTUNNEL -> "webtunnel"
                 BridgeTransport.SNOWFLAKE -> "snowflake"
-                BridgeTransport.MEEK_LITE -> "meek_lite"
+                BridgeTransport.MEEK_LITE -> "meek-azure"
                 else -> "obfs4"
             }
-            val body = """{"data":[{"type":"client-transports","version":"0.1.0","supported":["$tp"]}]}"""
-            con.outputStream.use { it.write(body.toByteArray()) }
-            if (con.responseCode !in 200..299) throw IOException("Moat HTTP ${con.responseCode}")
-            val resp = con.inputStream.bufferedReader().readText()
-            val lines = mutableListOf<String>()
-            Regex("\"(obfs4|webtunnel|snowflake|meek_lite) [^\"]+\"").findAll(resp).forEach {
-                lines.add(it.value.trim('"'))
+            
+            // Parse JSON response safely using Android's built-in JSONObject
+            val json = org.json.JSONObject(resp)
+            val dataArray = json.optJSONArray("data")
+            if (dataArray != null && dataArray.length() > 0) {
+                val attributes = dataArray.getJSONObject(0).optJSONObject("attributes")
+                if (attributes != null) {
+                    val bridgesArray = attributes.optJSONArray(key)
+                    if (bridgesArray != null) {
+                        for (i in 0 until bridgesArray.length()) {
+                            val line = bridgesArray.getString(i).trim()
+                            if (line.isNotBlank()) {
+                                // Map meek-azure back to meek_lite so Tor understands it
+                                val mappedLine = if (transport == BridgeTransport.MEEK_LITE) {
+                                    if (line.startsWith("meek-azure ")) {
+                                        line.replaceFirst("meek-azure ", "meek_lite ")
+                                    } else if (line.startsWith("meek ")) {
+                                        line.replaceFirst("meek ", "meek_lite ")
+                                    } else {
+                                        line
+                                    }
+                                } else {
+                                    line
+                                }
+                                lines.add(mappedLine)
+                            }
+                        }
+                    }
+                }
             }
-            if (lines.isEmpty()) lines.addAll(defaultBridges(transport))
+            
+            if (lines.isEmpty()) {
+                Logger.i("bridge-fetch", "No bridges returned for $key, using defaults")
+                lines.addAll(defaultBridges(transport))
+            }
             lines
         } catch (e: Exception) {
-            Logger.w("bridge-fetch", "fetch failed, using defaults", e)
+            Logger.w("bridge-fetch", "fetch failed (network down/censored?), using defaults: ${e.message}")
             defaultBridges(transport)
         }
     }
 
     fun defaultBridges(transport: BridgeTransport): List<String> = when (transport) {
         BridgeTransport.SNOWFLAKE -> listOf(
-            "snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://1098762253-1574206242 colo=12d",
-            "snowflake 192.0.2.4:80 8838024498816A039FCBBAB14E6F40A0843051FA fingerprint=8838024498816A039FCBBAB14E6F40A0843051FA url=https://1098762253-1574206242 colo=12d")
+            "snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://snowflake-broker.torproject.net/ front=ajax.aspnetcdn.com ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.bluesip.net:3478",
+            "snowflake 192.0.2.4:80 8838024498816A039FCBBAB14E6F40A0843051FA fingerprint=8838024498816A039FCBBAB14E6F40A0843051FA url=https://snowflake-broker.torproject.net/ front=ajax.aspnetcdn.com ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.bluesip.net:3478"
+        )
+        BridgeTransport.OBFS4 -> listOf(
+            "obfs4 192.95.36.142:443 CF547A53E2E69300F729606880016D41A25AF5DF cert=qD5aDaa5C3vSy6vFC9FObw iat-mode=0",
+            "obfs4 85.17.30.79:443 FC257DFD0C157EAFE12C5F47A53E2E69300F7296 cert=3XG5aDaa5C3vSy6vFC9FObw iat-mode=0"
+        )
         else -> emptyList()
     }
 
