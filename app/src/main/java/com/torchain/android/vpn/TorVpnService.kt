@@ -35,11 +35,6 @@ class TorVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         Logger.i("vpn", "TorVpnService starting...")
-        
-        // Compliance with Android 12-14: startForeground must be called immediately
-        val notification = buildNotification("Torchain VPN is active")
-        startForeground(NOTIF_ID, notification)
-        
         startVpn()
         return START_STICKY
     }
@@ -194,17 +189,7 @@ class TorVpnService : VpnService() {
         androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
 
-    private fun buildNotification(text: String): Notification {
-        val openIntent = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        return NotificationCompat.Builder(this, TorchainApp.CHANNEL_TOR)
-            .setSmallIcon(R.drawable.ic_torchain)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(text)
-            .setOngoing(true)
-            .setContentIntent(openIntent)
-            .build()
-    }
+
 
     override fun onDestroy() {
         super.onDestroy()
