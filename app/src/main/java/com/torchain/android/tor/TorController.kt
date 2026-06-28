@@ -143,12 +143,8 @@ class TorController(private val context: Context) {
             process = proc
             torRunning = true
 
-            // Populate PID in TorStatus
-            val pid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                proc.pid().toInt()
-            } else {
-                0
-            }
+            // Populate PID in TorStatus using reflection (Android Process doesn't expose pid() in SDK)
+            val pid = getProcessPid(proc)
             _status.value = _status.value.copy(pid = pid)
             Logger.i("tor", "Tor process launched with PID $pid")
 
@@ -226,6 +222,17 @@ class TorController(private val context: Context) {
         }
     }
 
+    private fun getProcessPid(p: Process): Int {
+        try {
+            val f = p.javaClass.getDeclaredField("pid")
+            f.isAccessible = true
+            return f.get(p) as Int
+        } catch (e: Exception) {
+            Logger.w("tor", "Failed to get process PID via reflection", e)
+        }
+        return 0
+    }
+
     private fun startPluggableTransport(transport: String): Int {
         try {
             val stateDir = context.cacheDir.resolve("pt").apply { mkdirs() }
@@ -233,19 +240,21 @@ class TorController(private val context: Context) {
             
             return when (transport) {
                 "obfs4" -> {
-                    Logger.i("tor-pt", "Starting obfs4 via IPtProxy...")
-                    val port = IPtProxy.IPtProxy.startObfs4(false, false)
+                    Logger.i("tor-pt", "Starting obfs4 (lyrebird) via IPtProxy...")
+                    val port = IPtProxy.IPtProxy.startLyrebird("", false, false, "INFO")
                     Logger.i("tor-pt", "obfs4 started on port $port")
-                    port
+                    port.toInt()
                 }
                 "snowflake" -> {
                     Logger.i("tor-pt", "Starting snowflake via IPtProxy...")
                     val ice = "stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.bluesip.net:3478"
                     val broker = "https://snowflake-broker.torproject.net/"
                     val front = "ajax.aspnetcdn.com"
-                    val port = IPtProxy.IPtProxy.startSnowflake(ice, broker, front, "", false, false)
+                    val port = IPtProxy.IPtProxy.startSnowflake(
+                        ice, broker, front, "", "", "", "", false, false, false, 1L
+                    )
                     Logger.i("tor-pt", "snowflake started on port $port")
-                    port
+                    port.toInt()
                 }
                 else -> 0
             }
@@ -413,7 +422,7 @@ class TorController(private val context: Context) {
 
         // Stop pluggable transports
         try {
-            IPtProxy.IPtProxy.stopObfs4()
+            IPtProxy.IPtProxy.stopLyrebird()
             IPtProxy.IPtProxy.stopSnowflake()
             Logger.i("tor-pt", "Pluggable transports stopped")
         } catch (e: Exception) {

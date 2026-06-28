@@ -1,3 +1,6 @@
+import java.net.URL
+import java.net.URLClassLoader
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
