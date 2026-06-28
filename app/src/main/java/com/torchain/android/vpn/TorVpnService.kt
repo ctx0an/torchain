@@ -89,8 +89,6 @@ class TorVpnService : VpnService() {
                     .addDnsServer(VPN_DNS_V6)
                     .setMtu(VPN_MTU)
                     .setBlocking(false)
-                    .allowFamily(android.system.OsConstants.AF_INET)
-                    .allowFamily(android.system.OsConstants.AF_INET6)
                 
                 Logger.i("vpn", "VpnService.Builder configured: IPv4=$VPN_ADDRESS/30 IPv6=$VPN_ADDRESS_V6/128 DNS=$VPN_DNS,$VPN_DNS_V6 MTU=$VPN_MTU")
 
