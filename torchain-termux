@@ -1,0 +1,361 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# torchain-termux - complete, standalone Torchain CLI for Termux
+#
+# This script provides a complete command-line interface to manage Tor,
+# pluggable transports, local network gateway sharing, and leak testing
+# in the Termux unprivileged environment.
+#
+# Usage:
+#   ./torchain-termux start
+#   ./torchain-termux stop
+#   ./torchain-termux status
+#   ./torchain-termux rotate
+#   ./torchain-termux bridge [obfs4 | snowflake | none]
+#   ./torchain-termux gateway [start | stop]
+#   ./torchain-termux leaktest
+#
+
+set -Eeuo pipefail
+
+# --- configuration paths -----------------------------------------------------
+CONF_DIR="$HOME/.config/torchain-termux"
+TORRC_PATH="$CONF_DIR/torrc"
+TOR_DATA_DIR="$CONF_DIR/tor_data"
+PRIVOXY_CONF_PATH="$CONF_DIR/privoxy.conf"
+BRIDGE_CONFIG_FILE="$CONF_DIR/bridge_type"
+
+# --- color codes -------------------------------------------------------------
+C_RED=$'\033[38;5;203m'
+C_GRN=$'\033[38;5;120m'
+C_YEL=$'\033[38;5;215m'
+C_BLU=$'\033[38;5;75m'
+C_RST=$'\033[0m'
+
+# --- helpers -----------------------------------------------------------------
+info() { echo "${C_BLU}i${C_RST} $*"; }
+success() { echo "${C_GRN}✓${C_RST} $*"; }
+warn() { echo "${C_YEL}⚠${C_RST} $*" >&2; }
+die() { echo "${C_RED}✗ $*${C_RST}" >&2; exit 1; }
+
+# --- ensure dependencies -----------------------------------------------------
+ensure_deps() {
+  local missing=()
+  for cmd in tor curl nc; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  
+  if [ ${#missing[@]} -ne 0 ]; then
+    info "Installing missing dependencies: ${missing[*]}..."
+    pkg update -y
+    pkg install -y "${missing[@]}"
+  fi
+}
+
+# --- read bridge configuration -----------------------------------------------
+get_bridge_type() {
+  if [ -f "$BRIDGE_CONFIG_FILE" ]; then
+    cat "$BRIDGE_CONFIG_FILE"
+  else
+    echo "none"
+  fi
+}
+
+# --- generate torrc ----------------------------------------------------------
+generate_torrc() {
+  local btype; btype=$(get_bridge_type)
+  mkdir -p "$TOR_DATA_DIR"
+  
+  cat << EOF > "$TORRC_PATH"
+# Torchain Termux torrc
+DataDirectory $TOR_DATA_DIR
+AvoidDiskWrites 1
+SocksPort 127.0.0.1:9050
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+DNSPort 127.0.0.1:5400
+AutomapHostsOnResolve 1
+AutomapHostsSuffixes .onion,.exit
+Log notice file $CONF_DIR/tor.log
+Log notice stdout
+EOF
+
+  if [ "$btype" = "snowflake" ]; then
+    # Ensure snowflake-client is installed
+    if [ ! -x "/data/data/com.termux/files/usr/bin/snowflake-client" ]; then
+      info "Installing snowflake package..."
+      pkg install -y snowflake
+    fi
+    cat << EOF >> "$TORRC_PATH"
+UseBridges 1
+ClientTransportPlugin snowflake exec /data/data/com.termux/files/usr/bin/snowflake-client
+Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://snowflake-broker.torproject.net/ front=ajax.aspnetcdn.com ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.bluesip.net:3478
+EOF
+  elif [ "$btype" = "obfs4" ]; then
+    # Ensure obfs4proxy/lyrebird is installed
+    if [ ! -x "/data/data/com.termux/files/usr/bin/lyrebird" ] && [ ! -x "/data/data/com.termux/files/usr/bin/obfs4proxy" ]; then
+      info "Installing obfs4proxy package..."
+      pkg install -y obfs4proxy
+    fi
+    local obfs_bin="/data/data/com.termux/files/usr/bin/lyrebird"
+    if [ ! -x "$obfs_bin" ]; then
+      obfs_bin="/data/data/com.termux/files/usr/bin/obfs4proxy"
+    fi
+    cat << EOF >> "$TORRC_PATH"
+UseBridges 1
+ClientTransportPlugin obfs4 exec $obfs_bin
+Bridge obfs4 192.95.36.142:443 CF547A53E2E69300F729606880016D41A25AF5DF cert=qD5aDaa5C3vSy6vFC9FObw iat-mode=0
+Bridge obfs4 85.17.30.79:443 FC257DFD0C157EAFE12C5F47A53E2E69300F7296 cert=3XG5aDaa5C3vSy6vFC9FObw iat-mode=0
+EOF
+  fi
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_start() {
+  ensure_deps
+  if pgrep -x "tor" >/dev/null; then
+    warn "Tor is already running."
+    return
+  fi
+  
+  info "Generating configuration..."
+  generate_torrc
+  
+  info "Starting Tor daemon..."
+  tor -f "$TORRC_PATH" --RunAsDaemon 1
+  
+  # Wait for SOCKS port to open
+  info "Waiting for Tor SOCKS proxy to come up..."
+  for i in {1..30}; do
+    if nc -z 127.0.0.1 9050 >/dev/null 2>&1; then
+      success "Tor started successfully!"
+      cmd_status
+      return
+    fi
+    sleep 0.5
+  done
+  die "Tor failed to start within 15 seconds. Check log: $CONF_DIR/tor.log"
+}
+
+cmd_stop() {
+  if ! pgrep -x "tor" >/dev/null; then
+    warn "Tor is not running."
+  else
+    info "Stopping Tor daemon..."
+    killall tor || true
+    success "Tor stopped."
+  fi
+  
+  if pgrep -x "privoxy" >/dev/null; then
+    info "Stopping Gateway (Privoxy)..."
+    killall privoxy || true
+    success "Gateway stopped."
+  fi
+}
+
+cmd_status() {
+  if pgrep -x "tor" >/dev/null; then
+    local pid; pid=$(pgrep -x "tor")
+    success "Tor is RUNNING (PID: $pid)"
+    echo "  - SOCKS5 Port:  127.0.0.1:9050"
+    echo "  - DNS Port:     127.0.0.1:5400"
+    echo "  - Control Port: 127.0.0.1:9051"
+    echo "  - Bridge Type:  $(get_bridge_type)"
+    
+    # Check gateway status
+    if pgrep -x "privoxy" >/dev/null; then
+      local g_pid; g_pid=$(pgrep -x "privoxy")
+      local local_ip; local_ip=$(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -v '127.0.0.1' | head -n 1 || echo "0.0.0.0")
+      success "Gateway is ACTIVE (PID: $g_pid)"
+      echo "    -> Share with your local network using HTTP Proxy: $local_ip:8118"
+    else
+      info "Gateway is INACTIVE"
+    fi
+    
+    # Query exit IP over Tor
+    echo -n "  - Querying Tor Exit IP... "
+    if ip_addr=$(curl --socks5-hostname 127.0.0.1:9050 -s --connect-timeout 5 https://api.ipify.org); then
+      echo -e "${C_GRN}$ip_addr${C_RST}"
+    else
+      echo -e "${C_RED}Failed (Tor may still be bootstrapping)${C_RST}"
+    fi
+  else
+    warn "Tor is NOT running."
+  fi
+}
+
+cmd_rotate() {
+  if ! pgrep -x "tor" >/dev/null; then
+    die "Tor is not running. Start it first."
+  fi
+  
+  info "Requesting new Tor identity (rotating circuits)..."
+  # Authentication is Cookie-based. Read cookie hex
+  local cookie_path="$TOR_DATA_DIR/control_auth_cookie"
+  if [ ! -f "$cookie_path" ]; then
+    die "Control port cookie file not found at $cookie_path"
+  fi
+  
+  local cookie_hex; cookie_hex=$(od -An -tx1 -v "$cookie_path" | tr -d ' \n')
+  
+  # Send AUTHENTICATE and SIGNAL NEWNYM to control port
+  (
+    echo -e "AUTHENTICATE $cookie_hex"
+    sleep 0.2
+    echo -e "SIGNAL NEWNYM"
+    sleep 0.2
+    echo -e "QUIT"
+  ) | nc 127.0.0.1 9051 >/dev/null
+  
+  success "New identity requested successfully!"
+  # Wait a bit and show new IP
+  sleep 1
+  cmd_status
+}
+
+cmd_bridge() {
+  local btype="${1:-}"
+  if [ -z "$btype" ]; then
+    echo "Current bridge type: $(get_bridge_type)"
+    echo "Usage: ./torchain-termux bridge [obfs4 | snowflake | none]"
+    return
+  fi
+  
+  case "$btype" in
+    obfs4|snowflake|none)
+      mkdir -p "$CONF_DIR"
+      echo "$btype" > "$BRIDGE_CONFIG_FILE"
+      success "Bridge type set to: $btype"
+      if pgrep -x "tor" >/dev/null; then
+        info "Restarting Tor to apply bridge configuration..."
+        cmd_stop
+        cmd_start
+      fi
+      ;;
+    *)
+      die "Invalid bridge type. Supported: obfs4, snowflake, none"
+      ;;
+  esac
+}
+
+cmd_gateway() {
+  local action="${1:-}"
+  if [ -z "$action" ]; then
+    echo "Usage: ./torchain-termux gateway [start | stop]"
+    return
+  fi
+  
+  if [ "$action" = "start" ]; then
+    if ! pgrep -x "tor" >/dev/null; then
+      die "Tor must be running to start the gateway. Run: ./torchain-termux start"
+    fi
+    
+    if pgrep -x "privoxy" >/dev/null; then
+      warn "Gateway is already running."
+      return
+    fi
+    
+    # Ensure privoxy is installed
+    command -v privoxy >/dev/null 2>&1 || {
+      info "Installing privoxy..."
+      pkg install -y privoxy
+    }
+    
+    # Generate privoxy config
+    mkdir -p "$CONF_DIR"
+    cat << EOF > "$PRIVOXY_CONF_PATH"
+confdir /data/data/com.termux/files/usr/etc/privoxy
+logdir $CONF_DIR
+logfile privoxy.log
+listen-address  0.0.0.0:8118
+forward-socks5t / 127.0.0.1:9050 .
+toggle 1
+enable-remote-toggle 0
+enable-remote-http-toggle 0
+enable-edit-actions 0
+buffer-limit 4096
+keep-alive-timeout 5
+socket-timeout 300
+EOF
+
+    info "Starting Privoxy gateway on port 8118..."
+    privoxy "$PRIVOXY_CONF_PATH"
+    
+    local local_ip; local_ip=$(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -v '127.0.0.1' | head -n 1 || echo "0.0.0.0")
+    success "Gateway started!"
+    echo "--------------------------------------------------"
+    echo " Configure other devices on your Wi-Fi network to:"
+    echo "   - HTTP Proxy:   $local_ip : 8118"
+    echo "   - SOCKS5 Proxy: $local_ip : 9050"
+    echo "   - DNS Server:   $local_ip : 5400"
+    echo "--------------------------------------------------"
+    
+  elif [ "$action" = "stop" ]; then
+    if ! pgrep -x "privoxy" >/dev/null; then
+      warn "Gateway is not running."
+    else
+      info "Stopping Privoxy gateway..."
+      killall privoxy || true
+      success "Gateway stopped."
+    fi
+  else
+    die "Invalid action. Supported: start, stop"
+  fi
+}
+
+cmd_leaktest() {
+  info "Running leak test..."
+  
+  echo -e "\n[1] Checking your normal connection (Direct)..."
+  local direct_ip=""
+  if direct_ip=$(curl -s --connect-timeout 5 https://api.ipify.org); then
+    echo "    Direct IP: $direct_ip"
+  else
+    warn "Could not check direct IP. Are you offline?"
+  fi
+  
+  echo -e "\n[2] Checking your Tor connection..."
+  if ! pgrep -x "tor" >/dev/null; then
+    warn "Tor is not running. Cannot test Tor connection."
+    return
+  fi
+  
+  local tor_ip=""
+  if tor_ip=$(curl --socks5-hostname 127.0.0.1:9050 -s --connect-timeout 8 https://api.ipify.org); then
+    echo "    Tor IP: $tor_ip"
+    if [ "$direct_ip" = "$tor_ip" ] && [ -n "$direct_ip" ]; then
+      echo -e "${C_RED}[!] LEAK DETECTED! Your Tor IP is the same as your direct IP!${C_RST}"
+    else
+      echo -e "${C_GRN}[+] SUCCESS: Your IP is successfully anonymized!${C_RST}"
+    fi
+  else
+    echo -e "${C_RED}[!] Tor connection failed or is still bootstrapping.${C_RST}"
+  fi
+}
+
+# --- CLI entrypoint ----------------------------------------------------------
+CMD="${1:-}"
+case "$CMD" in
+  start)    cmd_start ;;
+  stop)     cmd_stop ;;
+  status)   cmd_status ;;
+  rotate)   cmd_rotate ;;
+  bridge)   cmd_bridge "${2:-}" ;;
+  gateway)  cmd_gateway "${2:-}" ;;
+  leaktest) cmd_leaktest ;;
+  *)
+    echo "Torchain CLI for Termux"
+    echo "Usage: ./torchain-termux <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  start       Start the Tor daemon in the background"
+    echo "  stop        Stop Tor and the gateway"
+    echo "  status      Show running status, ports, and current exit IP"
+    echo "  rotate      Rotate circuits to get a new Tor identity/IP"
+    echo "  bridge      Configure pluggable transports (obfs4 | snowflake | none)"
+    echo "  gateway     Start/stop HTTP gateway sharing on port 8118"
+    echo "  leaktest    Compare direct IP vs Tor IP to verify protection"
+    echo ""
+    ;;
+esac
