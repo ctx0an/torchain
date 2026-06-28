@@ -126,12 +126,8 @@ class TorVpnService : VpnService() {
                 // 5. Write tproxy.conf configuration matching exact bundled library schema
                 val file = File(cacheDir, "tproxy.conf")
                 val conf = """
-                    misc:
-                      task-stack-size: $TPROXY_STACK_SIZE
                     tunnel:
                       mtu: $VPN_MTU
-                      ipv4: $VPN_ADDRESS
-                      ipv6: '$VPN_ADDRESS_V6'
                     socks5:
                       port: $LOCAL_PROXY_PORT
                       address: '$SOCKS_ADDRESS'
