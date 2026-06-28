@@ -62,7 +62,7 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.json:json:20240303")
-    implementation("com.netzarchitekten:IPtProxy:3.8.1")
+    implementation("com.netzarchitekten:IPtProxy:3.8.2")
 }
 
 tasks.register("assertNativeLibsExist") {
