@@ -17,8 +17,10 @@ object Logger {
     private val isoFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val lock = Any()
 
-    fun init(context: Context) {
-        logDir = File(context.filesDir, "logs").apply { mkdirs() }
+    fun init(context: Context) = synchronized(lock) {
+        if (!::logDir.isInitialized) {
+            logDir = File(context.applicationContext.filesDir, "logs").apply { mkdirs() }
+        }
     }
 
     fun currentLogFiles(): List<File> = synchronized(lock) {
@@ -29,7 +31,32 @@ object Logger {
     fun tail(lines: Int = 500): String = synchronized(lock) {
         val cur = File(logDir, "torchain.log")
         if (!cur.exists()) return ""
-        cur.readLines().takeLast(lines).joinToString("\n")
+
+        val maxReadBytes = 128 * 1024
+        val fileLength = cur.length()
+        val readLength = minOf(fileLength, maxReadBytes.toLong()).toInt()
+        if (readLength <= 0) return ""
+
+        val bytes = ByteArray(readLength)
+        try {
+            java.io.RandomAccessFile(cur, "r").use { raf ->
+                raf.seek(fileLength - readLength)
+                raf.readFully(bytes)
+            }
+        } catch (e: Exception) {
+            return ""
+        }
+
+        val content = String(bytes, Charsets.UTF_8)
+        val allLines = content.split('\n')
+        // The first line might be incomplete because we cut in the middle of a line.
+        // If we read only a portion of the file, drop the first line to avoid showing a partial log.
+        val linesToTake = if (fileLength > readLength && allLines.size > 1) {
+            allLines.drop(1)
+        } else {
+            allLines
+        }
+        linesToTake.takeLast(lines).joinToString("\n")
     }
 
     fun clear() {

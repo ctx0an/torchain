@@ -14,6 +14,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.io.IOException
 import java.net.InetSocketAddress
@@ -41,6 +43,8 @@ class TorController(private val context: Context) {
     // user-initiated stop. We now guard with `stopping` and launch on this scope.
     private val teardownScope = kotlinx.coroutines.CoroutineScope(
         kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
+
+    private val stateMutex = Mutex()
 
     fun locateTorBinary(): File? {
         val nativeDir = context.applicationInfo.nativeLibraryDir
@@ -77,174 +81,181 @@ class TorController(private val context: Context) {
         } catch (e: Exception) { return null }
     }
 
-    suspend fun start(config: TorchainConfig): Boolean = withContext(Dispatchers.IO) {
-        if (_status.value.state is TorState.Running ||
-            _status.value.state is TorState.Starting) {
-            return@withContext true
-        }
-        try {
-            val binary = locateTorBinary()
-            if (binary == null) {
-                val msg = "Tor binary not bundled in APK. Run scripts/download_tor.sh " +
-                          "and rebuild. (nativeLibraryDir=${context.applicationInfo.nativeLibraryDir})"
-                Logger.e("tor", msg)
-                _status.value = _status.value.copy(
-                    state = TorState.Error(msg), message = msg)
-                return@withContext false
+    suspend fun start(config: TorchainConfig): Boolean = stateMutex.withLock {
+        withContext(Dispatchers.IO) {
+            if (torRunning || _status.value.state is TorState.Running ||
+                _status.value.state is TorState.Starting ||
+                _status.value.state is TorState.Bootstrapping) {
+                return@withContext true
             }
-            Logger.i("tor", "Using tor binary: ${binary.absolutePath}")
-
-            dataDir.mkdirs()
-            val cookie = File(dataDir, "control_auth_cookie")
-            if (cookie.exists()) cookie.delete()
-
-            // Handle pluggable transports via IPtProxy
-            val ptPorts = mutableMapOf<String, Int>()
-            if (config.bridgesEnabled && config.bridgeTransport != "vanilla") {
-                val t = config.bridgeTransport
-                val tpName = if (t == "snowflake") "snowflake" else if (t == "custom") "obfs4" else t
-
-                // obfs4 / custom require the user to supply at least one bridge
-                // line (snowflake ships a built-in bridge in TorConfig). Without
-                // any Bridge lines Tor would start with UseBridges=1 but nothing
-                // to connect to, fail to bootstrap, and look like a crash — so
-                // surface a clear, actionable error up front instead.
-                if (tpName != "snowflake" && config.bridgeLines.isEmpty()) {
-                    val msg = "No bridge lines configured for $tpName. Open the Bridges " +
-                              "screen and add or fetch at least one $tpName bridge line first."
+            try {
+                val binary = locateTorBinary()
+                if (binary == null) {
+                    val msg = "Tor binary not bundled in APK. Run scripts/download_tor.sh " +
+                              "and rebuild. (nativeLibraryDir=${context.applicationInfo.nativeLibraryDir})"
                     Logger.e("tor", msg)
                     _status.value = _status.value.copy(
                         state = TorState.Error(msg), message = msg)
                     return@withContext false
                 }
+                Logger.i("tor", "Using tor binary: ${binary.absolutePath}")
 
-                val port = startPluggableTransport(tpName)
-                if (port > 0) {
-                    ptPorts[tpName] = port
-                } else {
-                    val msg = "Failed to start pluggable transport: $tpName. Aborting Tor start."
-                    Logger.e("tor", msg)
-                    _status.value = _status.value.copy(
-                        state = TorState.Error(msg), message = msg)
-                    return@withContext false
-                }
-            }
+                dataDir.mkdirs()
+                val cookie = File(dataDir, "control_auth_cookie")
+                if (cookie.exists()) cookie.delete()
 
-            val torrc = TorConfig.write(
-                dataDir = dataDir,
-                config = config,
-                ptPorts = ptPorts,
-                geoipFile = locateGeoip(),
-                geoip6File = locateGeoip6()
-            )
+                // Handle pluggable transports via IPtProxy
+                val ptPorts = mutableMapOf<String, Int>()
+                if (config.bridgesEnabled && config.bridgeTransport != "vanilla") {
+                    val t = config.bridgeTransport
+                    val tpName = if (t == "snowflake") "snowflake" else if (t == "custom") "obfs4" else t
 
-            _status.value = _status.value.copy(
-                state = TorState.Starting,
-                message = "Launching tor...")
-
-            val socksPort = 9050
-            val controlPort = 9051
-            val dnsPort = 5400
-
-            _status.value = _status.value.copy(
-                socksPort = socksPort,
-                controlPort = controlPort,
-                dnsPort = dnsPort
-            )
-
-            val cmd = listOf(
-                binary.absolutePath,
-                "-f", torrc.absolutePath,
-                "--RunAsDaemon", "0",
-                "--ignore-missing-torrc"
-            )
-            Logger.i("tor", "exec: ${cmd.joinToString(" ")}")
-            val pb = ProcessBuilder(cmd).apply {
-                redirectErrorStream(true)
-                directory(context.filesDir)
-            }
-            val proc = pb.start()
-            process = proc
-            torRunning = true
-
-            // Populate PID in TorStatus using reflection (Android Process doesn't expose pid() in SDK)
-            val pid = getProcessPid(proc)
-            _status.value = _status.value.copy(pid = pid)
-            Logger.i("tor", "Tor process launched with PID $pid")
-
-            // Process stdout pump
-            Thread({
-                try {
-                    proc.inputStream.bufferedReader().forEachLine { line ->
-                        Logger.i("tor-stdout", line)
-                    }
-                } catch (e: Exception) {
-                    Logger.w("tor-stdout", "stdout pump died", e)
-                }
-            }, "tor-stdout").start()
-
-            // Dead-process detection: watcher thread to monitor Tor process exit
-            Thread({
-                try {
-                    val exitCode = proc.waitFor()
-                    if (torRunning && !stopping) {
-                        val msg = "Tor process exited unexpectedly with code $exitCode"
+                    // obfs4 / custom require the user to supply at least one bridge
+                    // line (snowflake ships a built-in bridge in TorConfig). Without
+                    // any Bridge lines Tor would start with UseBridges=1 but nothing
+                    // to connect to, fail to bootstrap, and look like a crash — so
+                    // surface a clear, actionable error up front instead.
+                    if (tpName != "snowflake" && config.bridgeLines.isEmpty()) {
+                        val msg = "No bridge lines configured for $tpName. Open the Bridges " +
+                                   "screen and add or fetch at least one $tpName bridge line first."
                         Logger.e("tor", msg)
                         _status.value = _status.value.copy(
-                            state = TorState.Error(msg),
-                            message = msg,
-                            pid = 0
-                        )
-                        // Trigger clean teardown on the dedicated IO scope instead
-                        // of runBlocking on this raw thread. The `stopping` guard
-                        // prevents racing with a concurrent user-initiated stop.
-                        teardownScope.launch { stopInternal() }
+                            state = TorState.Error(msg), message = msg)
+                        return@withContext false
                     }
-                } catch (e: InterruptedException) {
-                    // Normal shutdown
-                } catch (e: Exception) {
-                    Logger.e("tor", "Error in Tor process watcher", e)
+
+                    val port = startPluggableTransport(tpName)
+                    if (port > 0) {
+                        ptPorts[tpName] = port
+                    } else {
+                        val msg = "Failed to start pluggable transport: $tpName. Aborting Tor start."
+                        Logger.e("tor", msg)
+                        _status.value = _status.value.copy(
+                            state = TorState.Error(msg), message = msg)
+                        return@withContext false
+                    }
                 }
-            }, "tor-watcher").start()
 
-            if (!waitForControlPort(controlPort, 20000)) {
-                val msg = "Tor control port ($controlPort) did not come up within 20s"
-                Logger.e("tor", msg)
-                throw IOException(msg)
+                val torrc = TorConfig.write(
+                    dataDir = dataDir,
+                    config = config,
+                    ptPorts = ptPorts,
+                    geoipFile = locateGeoip(),
+                    geoip6File = locateGeoip6()
+                )
+
+                _status.value = _status.value.copy(
+                    state = TorState.Starting,
+                    message = "Launching tor...")
+
+                val socksPort = 9050
+                val controlPort = 9051
+                val dnsPort = 5400
+
+                _status.value = _status.value.copy(
+                    socksPort = socksPort,
+                    controlPort = controlPort,
+                    dnsPort = dnsPort
+                )
+
+                val cmd = listOf(
+                    binary.absolutePath,
+                    "-f", torrc.absolutePath,
+                    "--RunAsDaemon", "0",
+                    "--ignore-missing-torrc"
+                )
+                Logger.i("tor", "exec: ${cmd.joinToString(" ")}")
+                val pb = ProcessBuilder(cmd).apply {
+                    redirectErrorStream(true)
+                    directory(context.filesDir)
+                }
+                val proc = pb.start()
+                process = proc
+                torRunning = true
+
+                // Populate PID in TorStatus using reflection (Android Process doesn't expose pid() in SDK)
+                val pid = getProcessPid(proc)
+                _status.value = _status.value.copy(pid = pid)
+                Logger.i("tor", "Tor process launched with PID $pid")
+
+                // Process stdout pump
+                Thread({
+                    try {
+                        proc.inputStream.bufferedReader().forEachLine { line ->
+                            Logger.i("tor-stdout", line)
+                        }
+                    } catch (e: Exception) {
+                        Logger.w("tor-stdout", "stdout pump died", e)
+                    }
+                }, "tor-stdout").apply { isDaemon = true }.start()
+
+                // Dead-process detection: watcher thread to monitor Tor process exit
+                Thread({
+                    try {
+                        val exitCode = proc.waitFor()
+                        if (torRunning && !stopping) {
+                            val msg = "Tor process exited unexpectedly with code $exitCode"
+                            Logger.e("tor", msg)
+                            _status.value = _status.value.copy(
+                                state = TorState.Error(msg),
+                                message = msg,
+                                pid = 0
+                            )
+                            // Trigger clean teardown on the dedicated IO scope instead
+                            // of runBlocking on this raw thread. The `stopping` guard
+                            // prevents racing with a concurrent user-initiated stop.
+                            teardownScope.launch {
+                                stateMutex.withLock {
+                                    stopInternal()
+                                }
+                            }
+                        }
+                    } catch (e: InterruptedException) {
+                        // Normal shutdown
+                    } catch (e: Exception) {
+                        Logger.e("tor", "Error in Tor process watcher", e)
+                    }
+                }, "tor-watcher").apply { isDaemon = true }.start()
+
+                if (!waitForControlPort(controlPort, 20000)) {
+                    val msg = "Tor control port ($controlPort) did not come up within 20s"
+                    Logger.e("tor", msg)
+                    throw IOException(msg)
+                }
+                Logger.i("tor", "Control port $controlPort is up")
+
+                if (!waitForCookie(cookie, 5000)) {
+                    Logger.w("tor", "control_auth_cookie not present after 5s; auth may fail")
+                } else {
+                    Logger.i("tor", "Control auth cookie found")
+                }
+
+                control = ControlPortClient("127.0.0.1", controlPort, cookie).also {
+                    it.setEventListener(::onEvent)
+                    it.connect()
+                    it.setEvents("STATUS_CLIENT", "BW", "CIRC", "NOTICE", "WARN", "ERR")
+                }
+                Logger.i("tor", "Control port connected and authenticated")
+
+                if (!waitForSocksProxy(socksPort, 10000)) {
+                    Logger.w("tor", "SOCKS proxy :$socksPort not responding after 10s — VPN may not route traffic")
+                } else {
+                    Logger.i("tor", "SOCKS proxy :$socksPort is accepting connections")
+                }
+
+                _status.value = _status.value.copy(
+                    state = TorState.Bootstrapping(0, "starting"),
+                    message = "Bootstrapping...")
+                true
+            } catch (e: Exception) {
+                Logger.e("tor", "start failed", e)
+                _status.value = _status.value.copy(
+                    state = TorState.Error(e.message ?: "unknown error"),
+                    message = e.message ?: "unknown error"
+                )
+                stopInternal()
+                false
             }
-            Logger.i("tor", "Control port $controlPort is up")
-
-            if (!waitForCookie(cookie, 5000)) {
-                Logger.w("tor", "control_auth_cookie not present after 5s; auth may fail")
-            } else {
-                Logger.i("tor", "Control auth cookie found")
-            }
-
-            control = ControlPortClient("127.0.0.1", controlPort, cookie).also {
-                it.setEventListener(::onEvent)
-                it.connect()
-                it.setEvents("STATUS_CLIENT", "BW", "CIRC", "NOTICE", "WARN", "ERR")
-            }
-            Logger.i("tor", "Control port connected and authenticated")
-
-            if (!waitForSocksProxy(socksPort, 10000)) {
-                Logger.w("tor", "SOCKS proxy :$socksPort not responding after 10s — VPN may not route traffic")
-            } else {
-                Logger.i("tor", "SOCKS proxy :$socksPort is accepting connections")
-            }
-
-            _status.value = _status.value.copy(
-                state = TorState.Bootstrapping(0, "starting"),
-                message = "Bootstrapping...")
-            true
-        } catch (e: Exception) {
-            Logger.e("tor", "start failed", e)
-            _status.value = _status.value.copy(
-                state = TorState.Error(e.message ?: "unknown error"),
-                message = e.message ?: "unknown error"
-            )
-            stopInternal()
-            false
         }
     }
 
@@ -309,6 +320,8 @@ class TorController(private val context: Context) {
     private fun waitForCookie(cookie: File, timeoutMs: Long): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
+            val proc = process
+            if (proc != null && !proc.isAlive) return false
             if (cookie.exists() && cookie.length() > 0L) return true
             try { Thread.sleep(100) } catch (_: Exception) {}
         }
@@ -318,6 +331,8 @@ class TorController(private val context: Context) {
     private fun waitForControlPort(port: Int, timeoutMs: Long): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
+            val proc = process
+            if (proc != null && !proc.isAlive) return false
             try {
                 Socket().use { s ->
                     s.connect(InetSocketAddress("127.0.0.1", port), 300)
@@ -332,6 +347,8 @@ class TorController(private val context: Context) {
     private fun waitForSocksProxy(port: Int, timeoutMs: Long): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
+            val proc = process
+            if (proc != null && !proc.isAlive) return false
             try {
                 Socket().use { s ->
                     s.connect(InetSocketAddress("127.0.0.1", port), 300)
@@ -381,12 +398,14 @@ class TorController(private val context: Context) {
     }
 
     private fun queryExitIpAsync() {
-        Thread({
+        teardownScope.launch {
             try {
                 Logger.i("tor", "Querying exit IP over Tor SOCKS proxy...")
                 val url = java.net.URL("https://api.ipify.org")
                 val proxy = java.net.Proxy(java.net.Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", 9050))
-                val con = url.openConnection(proxy) as java.net.HttpURLConnection
+                val con = withContext(Dispatchers.IO) {
+                    url.openConnection(proxy) as java.net.HttpURLConnection
+                }
                 con.connectTimeout = 15000
                 con.readTimeout = 15000
                 val ip = con.inputStream.bufferedReader().use { it.readText().trim() }
@@ -395,12 +414,13 @@ class TorController(private val context: Context) {
             } catch (e: Exception) {
                 Logger.w("tor", "Exit IP query failed: ${e.message}")
             }
-        }, "tor-exitip").start()
+        }
     }
 
     suspend fun rotateIdentity(): Boolean = withContext(Dispatchers.IO) {
+        val c = control ?: return@withContext false
         try {
-            control?.signal("NEWNYM")
+            c.signal("NEWNYM")
             _status.value = _status.value.copy(message = "New identity requested")
             true
         } catch (e: Exception) {
@@ -445,7 +465,7 @@ class TorController(private val context: Context) {
         }
     }
 
-    suspend fun stop(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun stop(): Boolean = stateMutex.withLock {
         stopInternal()
         true
     }
@@ -501,7 +521,7 @@ class TorController(private val context: Context) {
         stopping = false
     }
 
-    suspend fun panic() {
+    suspend fun panic() = stateMutex.withLock {
         stopInternal()
         _status.value = _status.value.copy(
             state = TorState.Stopped, message = "Panic - all traffic dropped")

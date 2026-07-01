@@ -43,15 +43,18 @@ object TorStatusBus {
     }
 
     @Volatile private var registered = false
-    fun register(context: Context) {
+    private val lock = Any()
+
+    fun register(context: Context) = synchronized(lock) {
         if (registered) return
-        LocalBroadcastManager.getInstance(context).registerReceiver(
+        LocalBroadcastManager.getInstance(context.applicationContext).registerReceiver(
             receiver, IntentFilter(TorService.ACTION_STATUS))
         registered = true
     }
-    fun unregister(context: Context) {
+
+    fun unregister(context: Context) = synchronized(lock) {
         if (!registered) return
-        LocalBroadcastManager.getInstance(context).unregisterReceiver(receiver)
+        LocalBroadcastManager.getInstance(context.applicationContext).unregisterReceiver(receiver)
         registered = false
     }
 }

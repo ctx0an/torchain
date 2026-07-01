@@ -9,7 +9,6 @@ import com.torchain.android.util.Logger
 class TorchainApp : Application() {
     override fun onCreate() {
         super.onCreate()
-        instance = this
         Logger.init(this)
         Logger.i("TorchainApp", "Torchain starting (v${BuildConfig.VERSION_NAME})")
         createNotificationChannels()
@@ -35,7 +34,5 @@ class TorchainApp : Application() {
     companion object {
         const val CHANNEL_TOR = "tor_service"
         const val CHANNEL_WATCHDOG = "watchdog"
-        @Volatile lateinit var instance: TorchainApp
-            private set
     }
 }

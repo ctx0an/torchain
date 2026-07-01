@@ -39,7 +39,15 @@ class TorService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         tor = TorController(this)
-        startForeground(NOTIF_ID, buildNotification("Torchain starting..."))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIF_ID,
+                buildNotification("Torchain starting..."),
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIF_ID, buildNotification("Torchain starting..."))
+        }
         statusJob = lifecycleScope.launch {
             // Use `collect` (not collectLatest) so state side-effects (VPN start,
             // error cleanup) always run to completion instead of being cancelled
@@ -70,6 +78,14 @@ class TorService : LifecycleService() {
                         vpnStarted = false
                     }
                     is TorState.Stopped -> {
+                        if (proxyMode == "vpn") {
+                            try {
+                                stopService(Intent(this@TorService, com.torchain.android.vpn.TorVpnService::class.java))
+                                Logger.i("TorService", "Tor stopped, stopped TorVpnService")
+                            } catch (e: Exception) {
+                                Logger.w("TorService", "Failed to stop VPN on Tor stopped", e)
+                            }
+                        }
                         vpnStarted = false
                     }
                     else -> { /* Starting / Bootstrapping / Stopping — wait */ }
@@ -208,7 +224,19 @@ class TorService : LifecycleService() {
 
     override fun onDestroy() {
         statusJob?.cancel()
-        lifecycleScope.launch { tor.stop() }
+        if (proxyMode == "vpn") {
+            try {
+                stopService(Intent(this, com.torchain.android.vpn.TorVpnService::class.java))
+            } catch (_: Exception) {}
+        }
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.cancel(NOTIF_ID)
+        } catch (_: Exception) {}
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            tor.stop()
+        }
         super.onDestroy()
     }
 

@@ -104,24 +104,26 @@ EOF
 
   if [ "$btype" = "snowflake" ]; then
     # Ensure snowflake-client is installed
-    if [ ! -x "/data/data/com.termux/files/usr/bin/snowflake-client" ]; then
+    local termux_prefix="${PREFIX:-/data/data/com.termux/files/usr}"
+    if [ ! -x "$termux_prefix/bin/snowflake-client" ]; then
       info "Installing snowflake package..."
       pkg install -y snowflake
     fi
     cat << EOF >> "$TORRC_PATH"
 UseBridges 1
-ClientTransportPlugin snowflake exec /data/data/com.termux/files/usr/bin/snowflake-client
+ClientTransportPlugin snowflake exec $termux_prefix/bin/snowflake-client
 Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://snowflake-broker.torproject.net/ front=ajax.aspnetcdn.com ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.bluesip.net:3478
 EOF
   elif [ "$btype" = "obfs4" ]; then
     # Ensure obfs4proxy/lyrebird is installed
-    if [ ! -x "/data/data/com.termux/files/usr/bin/lyrebird" ] && [ ! -x "/data/data/com.termux/files/usr/bin/obfs4proxy" ]; then
+    local termux_prefix="${PREFIX:-/data/data/com.termux/files/usr}"
+    if [ ! -x "$termux_prefix/bin/lyrebird" ] && [ ! -x "$termux_prefix/bin/obfs4proxy" ]; then
       info "Installing obfs4proxy package..."
       pkg install -y obfs4proxy
     fi
-    local obfs_bin="/data/data/com.termux/files/usr/bin/lyrebird"
+    local obfs_bin="$termux_prefix/bin/lyrebird"
     if [ ! -x "$obfs_bin" ]; then
-      obfs_bin="/data/data/com.termux/files/usr/bin/obfs4proxy"
+      obfs_bin="$termux_prefix/bin/obfs4proxy"
     fi
     cat << EOF >> "$TORRC_PATH"
 UseBridges 1
@@ -139,8 +141,10 @@ cmd_install() {
   ensure_deps
   
   # Copy to Termux bin directory as 'torchain' (available in default $PATH)
-  local bin_path="/data/data/com.termux/files/usr/bin/torchain"
-  cp "$0" "$bin_path"
+  local termux_prefix="${PREFIX:-/data/data/com.termux/files/usr}"
+  local bin_path="$termux_prefix/bin/torchain"
+  local script_path="${BASH_SOURCE[0]}"
+  cp "$script_path" "$bin_path"
   chmod +x "$bin_path"
   success "Copied script to $bin_path (available in PATH as 'torchain')"
   
@@ -157,7 +161,7 @@ cmd_install() {
         alias_line="alias torchain '$bin_path'"
       fi
       
-      if [ ! -f "$rc" ] || ! grep -q "alias torchain=" "$rc" && ! grep -q "alias torchain " "$rc"; then
+      if [ ! -f "$rc" ] || { ! grep -q "alias torchain=" "$rc" && ! grep -q "alias torchain " "$rc"; }; then
         echo -e "\n# Torchain CLI Alias\n$alias_line" >> "$rc"
         info "Added alias to $rc"
         updated=1
@@ -187,15 +191,22 @@ cmd_start() {
   
   # Wait for SOCKS port to open
   info "Waiting for Tor SOCKS proxy to come up..."
+  local tor_ok=0
   for i in {1..30}; do
     if is_port_open "127.0.0.1" 9050; then
-      success "Tor started successfully!"
-      cmd_status
-      return
+      tor_ok=1
+      break
     fi
     sleep 0.5
   done
-  die "Tor failed to start within 15 seconds. Check log: $CONF_DIR/tor.log"
+
+  if [ "$tor_ok" -eq 1 ]; then
+    success "Tor started successfully!"
+    cmd_status
+  else
+    killall tor 2>/dev/null || true
+    die "Tor failed to start within 15 seconds. Check log: $CONF_DIR/tor.log"
+  fi
 }
 
 cmd_stop() {
@@ -261,11 +272,13 @@ cmd_rotate() {
   
   # Use Bash built-in TCP socket to communicate with Tor control port (no netcat/nc needed!)
   if exec 3<>/dev/tcp/127.0.0.1/9051; then
-    echo -e "AUTHENTICATE $cookie_hex" >&3
-    sleep 0.2
-    echo -e "SIGNAL NEWNYM" >&3
-    sleep 0.2
-    echo -e "QUIT" >&3
+    {
+      echo -e "AUTHENTICATE $cookie_hex"
+      sleep 0.2
+      echo -e "SIGNAL NEWNYM"
+      sleep 0.2
+      echo -e "QUIT"
+    } >&3 2>/dev/null || true
     exec 3>&-
     success "New identity requested successfully!"
   else
@@ -327,8 +340,9 @@ cmd_gateway() {
     
     # Generate privoxy config
     mkdir -p "$CONF_DIR"
+    local termux_prefix="${PREFIX:-/data/data/com.termux/files/usr}"
     cat << EOF > "$PRIVOXY_CONF_PATH"
-confdir /data/data/com.termux/files/usr/etc/privoxy
+confdir $termux_prefix/etc/privoxy
 logdir $CONF_DIR
 logfile privoxy.log
 listen-address  0.0.0.0:8118
@@ -345,6 +359,22 @@ EOF
     info "Starting Privoxy gateway on port 8118..."
     privoxy "$PRIVOXY_CONF_PATH"
     
+    # Wait for Privoxy port to open
+    info "Waiting for Gateway (Privoxy) to come up..."
+    local privoxy_ok=0
+    for i in {1..10}; do
+      if is_port_open "127.0.0.1" 8118; then
+        privoxy_ok=1
+        break
+      fi
+      sleep 0.5
+    done
+
+    if [ "$privoxy_ok" -ne 1 ]; then
+      killall privoxy 2>/dev/null || true
+      die "Gateway (Privoxy) failed to start. Check if port 8118 is already in use."
+    fi
+
     local local_ip; local_ip=$(get_local_ip)
     success "Gateway started!"
     echo "--------------------------------------------------"

@@ -43,7 +43,8 @@ fi
 info "removing torchain firewall chains..."
 if have iptables; then
   for spec in "nat TORCHAIN" "filter TORCHAIN_OUT"; do
-    set -- "$spec"; table="$1"; chain="$2"
+    table="${spec%% *}"
+    chain="${spec##* }"
     # delete every OUTPUT jump (handles duplicates that used to strand a DROP)
     while iptables -t "$table" -C OUTPUT -j "$chain" 2>/dev/null; do
       iptables -t "$table" -D OUTPUT -j "$chain" 2>/dev/null || break
@@ -65,7 +66,7 @@ info "checking DNS..."
 have chattr && chattr -i "$RESOLV" 2>/dev/null || true
 dns_broken=1
 if [ -f "$RESOLV" ]; then
-  if grep -q '^nameserver' "$RESOLV" && grep '^nameserver' "$RESOLV" | grep -qvE '127\\.0\\.0\\.1|::1'; then
+  if grep -q '^nameserver' "$RESOLV" && grep '^nameserver' "$RESOLV" | grep -qvE '127\.0\.0\.1|::1'; then
     dns_broken=0
   fi
 fi

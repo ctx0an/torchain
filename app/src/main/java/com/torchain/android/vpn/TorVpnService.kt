@@ -42,6 +42,7 @@ class TorVpnService : VpnService() {
 
     private var tunFd: ParcelFileDescriptor? = null
     @Volatile private var running = false
+    @Volatile private var isStarting = false
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var localProxy: LocalSocksProxy? = null
     private var tproxyThread: Thread? = null
@@ -49,9 +50,21 @@ class TorVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         Logger.i("vpn", "TorVpnService onStartCommand (no FGS — establish() keeps alive)")
+        
+        synchronized(this) {
+            if (running || isStarting) {
+                Logger.i("vpn", "TorVpnService already running or starting, ignoring start request")
+                return START_STICKY
+            }
+            isStarting = true
+        }
+
         scope.launch(Dispatchers.IO) {
             try {
                 startVpn()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                Logger.i("vpn", "VPN start cancelled.")
+                throw e
             } catch (e: java.lang.SecurityException) {
                 Logger.e("vpn", "VPN permission denied: ${e.message}", e)
                 updateTorStateError("VPN permission denied: ${e.message}")
@@ -60,6 +73,10 @@ class TorVpnService : VpnService() {
                 Logger.e("vpn", "startVpn failed: ${e.message}", e)
                 updateTorStateError("VPN start failed: ${e.message}")
                 stopSelfSafely()
+            } finally {
+                synchronized(this@TorVpnService) {
+                    isStarting = false
+                }
             }
         }
         return START_STICKY
@@ -97,95 +114,119 @@ class TorVpnService : VpnService() {
         }
         Logger.i("vpn", "Tor SOCKS proxy is ready. Proceeding to establish VPN.")
 
-        // 3. Start local SOCKS proxy to intercept DNS and forward TCP
-        Logger.i("vpn", "Starting LocalSocksProxy on port $LOCAL_PROXY_PORT...")
-        localProxy = LocalSocksProxy(LOCAL_PROXY_PORT, TOR_SOCKS_PORT, TOR_DNS_PORT)
-        localProxy?.start()
-
-        // 4. Configure VpnService.Builder
-        Logger.i("vpn", "Building VpnService configuration...")
-        val builder = Builder()
-            .setSession(getString(R.string.app_name))
-            .addAddress(VPN_ADDRESS, 30)
-            .addRoute("0.0.0.0", 0)
-            // IPv6 support: route all IPv6 traffic into the tunnel to prevent leaks
-            .addAddress(VPN_ADDRESS_V6, 128)
-            .addRoute("::", 0)
-            .addDnsServer(VPN_DNS)
-            .addDnsServer(VPN_DNS_V6)
-            .setMtu(VPN_MTU)
-            .setBlocking(false)
-
-        Logger.i("vpn", "VpnService.Builder configured: IPv4=$VPN_ADDRESS/30 IPv6=$VPN_ADDRESS_V6/128 DNS=$VPN_DNS,$VPN_DNS_V6 MTU=$VPN_MTU")
-
+        var localProxyStarted = false
+        var establishedPfd: ParcelFileDescriptor? = null
         try {
-            builder.addDisallowedApplication(packageName)
-            Logger.i("vpn", "Excluded $packageName from VPN to prevent routing loop")
-        } catch (e: Exception) {
-            Logger.w("vpn", "Failed to exclude self application", e)
-        }
+            // 3. Start local SOCKS proxy to intercept DNS and forward TCP
+            Logger.i("vpn", "Starting LocalSocksProxy on port $LOCAL_PROXY_PORT...")
+            val proxy = LocalSocksProxy(LOCAL_PROXY_PORT, TOR_SOCKS_PORT, TOR_DNS_PORT)
+            localProxy = proxy
+            proxy.start()
+            localProxyStarted = true
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.setMetered(false)
-        }
+            // 4. Configure VpnService.Builder
+            Logger.i("vpn", "Building VpnService configuration...")
+            val builder = Builder()
+                .setSession(getString(R.string.app_name))
+                .addAddress(VPN_ADDRESS, 30)
+                .addRoute("0.0.0.0", 0)
+                // IPv6 support: route all IPv6 traffic into the tunnel to prevent leaks
+                .addAddress(VPN_ADDRESS_V6, 128)
+                .addRoute("::", 0)
+                .addDnsServer(VPN_DNS)
+                .addDnsServer(VPN_DNS_V6)
+                .setMtu(VPN_MTU)
+                .setBlocking(false)
 
-        val pi = android.app.PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            android.app.PendingIntent.FLAG_IMMUTABLE
-        )
-        builder.setConfigureIntent(pi)
+            Logger.i("vpn", "VpnService.Builder configured: IPv4=$VPN_ADDRESS/30 IPv6=$VPN_ADDRESS_V6/128 DNS=$VPN_DNS,$VPN_DNS_V6 MTU=$VPN_MTU")
 
-        Logger.i("vpn", "Calling VpnService.Builder.establish()...")
-        val pfd = builder.establish()
-        if (pfd == null) {
-            val msg = "VpnService.establish() returned null — user may have revoked VPN permission"
-            Logger.e("vpn", msg)
-            updateTorStateError(msg)
-            stopSelfSafely()
-            return
-        }
-        tunFd = pfd
-        running = true
-        Logger.i("vpn", "TUN established fd=${pfd.fd}, MTU $VPN_MTU — VPN is UP")
-
-        // 5. Write tproxy.conf configuration matching exact bundled library schema
-        val file = File(cacheDir, "tproxy.conf")
-        val conf = """
-            tunnel:
-              mtu: $VPN_MTU
-            socks5:
-              port: $LOCAL_PROXY_PORT
-              address: '$SOCKS_ADDRESS'
-              udp: '$SOCKS_UDP_MODE'
-        """.trimIndent()
-        file.writeText(conf)
-        Logger.i("vpn", "tproxy.conf written to ${file.absolutePath}")
-
-        // 6. Start TProxy native library on a dedicated, trackable worker thread.
-        //    Keeping a reference to this thread lets teardown() join it before
-        //    closing the TUN fd, which avoids the native reader hitting EBADF.
-        Logger.i("vpn", "Starting TProxy native library background thread...")
-        val worker = Thread({
             try {
-                Logger.i("vpn-tproxy", "Calling TProxyStartService...")
-                org.torproject.android.service.TProxyService.TProxyStartService(file.absolutePath, pfd.fd)
-                Logger.i("vpn-tproxy", "TProxyStartService returned normally")
-            } catch (t: Throwable) {
-                Logger.e("vpn-tproxy", "TProxyStartService crashed: ${t.message}", t)
-                // If the native tunnel dies, surface a clear error and tear down
-                // gracefully instead of leaving a half-open VPN.
-                if (running) {
-                    updateTorStateError("VPN tunnel crashed: ${t.message}")
-                    stopSelfSafely()
+                builder.addDisallowedApplication(packageName)
+                Logger.i("vpn", "Excluded $packageName from VPN to prevent routing loop")
+            } catch (e: Exception) {
+                Logger.w("vpn", "Failed to exclude self application", e)
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.setMetered(false)
+            }
+
+            val pi = android.app.PendingIntent.getActivity(
+                this, 0,
+                Intent(this, MainActivity::class.java),
+                android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.setConfigureIntent(pi)
+
+            Logger.i("vpn", "Calling VpnService.Builder.establish()...")
+            val pfd = builder.establish()
+            if (pfd == null) {
+                throw java.lang.IllegalStateException("VpnService.establish() returned null — user may have revoked VPN permission")
+            }
+            establishedPfd = pfd
+            tunFd = pfd
+            Logger.i("vpn", "TUN established fd=${pfd.fd}, MTU $VPN_MTU — VPN is UP")
+
+            // 5. Write tproxy.conf configuration matching exact bundled library schema
+            val file = File(cacheDir, "tproxy.conf")
+            val conf = """
+                tunnel:
+                  mtu: $VPN_MTU
+                socks5:
+                  port: $LOCAL_PROXY_PORT
+                  address: '$SOCKS_ADDRESS'
+                  udp: '$SOCKS_UDP_MODE'
+            """.trimIndent()
+            file.writeText(conf)
+            Logger.i("vpn", "tproxy.conf written to ${file.absolutePath}")
+
+            // 6. Start TProxy native library on a dedicated, trackable worker thread.
+            //    Keeping a reference to this thread lets teardown() join it before
+            //    closing the TUN fd, which avoids the native reader hitting EBADF.
+            Logger.i("vpn", "Starting TProxy native library background thread...")
+            val worker = Thread({
+                try {
+                    Logger.i("vpn-tproxy", "Calling TProxyStartService...")
+                    org.torproject.android.service.TProxyService.TProxyStartService(file.absolutePath, pfd.fd)
+                    Logger.i("vpn-tproxy", "TProxyStartService returned normally")
+                } catch (t: Throwable) {
+                    Logger.e("vpn-tproxy", "TProxyStartService crashed: ${t.message}", t)
+                    // If the native tunnel dies, surface a clear error and tear down
+                    // gracefully instead of leaving a half-open VPN.
+                    if (running) {
+                        updateTorStateError("VPN tunnel crashed: ${t.message}")
+                        stopSelfSafely()
+                    }
+                }
+            }, "tproxy-worker").apply {
+                isDaemon = true
+                start()
+            }
+            tproxyThread = worker
+            running = true
+            Logger.i("vpn", "TProxy worker thread dispatched — VPN fully active")
+        } catch (e: Throwable) {
+            if (!running) {
+                Logger.e("vpn", "VPN startup failed or was cancelled, cleaning up local resources", e)
+                try {
+                    establishedPfd?.close()
+                } catch (closeEx: Exception) {
+                    Logger.w("vpn", "Failed to close established PFD during startup failure", closeEx)
+                }
+                if (tunFd == establishedPfd) {
+                    tunFd = null
+                }
+                if (localProxyStarted) {
+                    try {
+                        localProxy?.stop()
+                    } catch (stopEx: Exception) {
+                        Logger.w("vpn", "Failed to stop local proxy during startup failure", stopEx)
+                    }
+                    localProxy = null
                 }
             }
-        }, "tproxy-worker").apply {
-            isDaemon = true
-            start()
+            throw e
         }
-        tproxyThread = worker
-        Logger.i("vpn", "TProxy worker thread dispatched — VPN fully active")
     }
 
     private fun isPortOpen(host: String, port: Int): Boolean {
@@ -223,7 +264,7 @@ class TorVpnService : VpnService() {
         stopSelf()
     }
 
-    private fun teardown() {
+    private fun teardown() = synchronized(this) {
         if (!running && tunFd == null && localProxy == null && tproxyThread == null) {
             try { scope.cancel() } catch (_: Exception) {}
             return

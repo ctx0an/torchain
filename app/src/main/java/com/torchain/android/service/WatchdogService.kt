@@ -21,7 +21,15 @@ class WatchdogService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
-        startForeground(NOTIF_ID, buildNotification("Watchdog active"))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIF_ID,
+                buildNotification("Watchdog active"),
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIF_ID, buildNotification("Watchdog active"))
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -54,7 +62,15 @@ class WatchdogService : LifecycleService() {
     }
 
     override fun onBind(intent: Intent): IBinder? { super.onBind(intent); return null }
-    override fun onDestroy() { rotateJob?.cancel(); super.onDestroy() }
+    override fun onDestroy() {
+        rotateJob?.cancel()
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            val nm = getSystemService(android.app.NotificationManager::class.java)
+            nm?.cancel(NOTIF_ID)
+        } catch (_: Exception) {}
+        super.onDestroy()
+    }
 
     private fun buildNotification(text: String): Notification =
         NotificationCompat.Builder(this, TorchainApp.CHANNEL_WATCHDOG)

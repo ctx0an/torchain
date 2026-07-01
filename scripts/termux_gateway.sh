@@ -57,10 +57,11 @@ EOF
 
 # 4. Write Privoxy configuration (converts SOCKS5 to HTTP proxy for devices that don't support SOCKS5)
 PRIVOXY_CONF_PATH="$CONF_DIR/privoxy.conf"
+TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 echo -e "[*] Writing Privoxy configuration to $PRIVOXY_CONF_PATH..."
 cat << EOF > "$PRIVOXY_CONF_PATH"
 # Torchain Termux Gateway Privoxy Config
-confdir /data/data/com.termux/files/usr/etc/privoxy
+confdir $TERMUX_PREFIX/etc/privoxy
 logdir $CONF_DIR
 logfile privoxy.log
 
@@ -86,7 +87,13 @@ echo -e "[*] Creating start script at $START_SCRIPT..."
 cat << 'EOF' > "$START_SCRIPT"
 #!/data/data/com.termux/files/usr/bin/bash
 CONF_DIR="$HOME/.config/torchain-gateway"
-LOCAL_IP=$(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -v '127.0.0.1' | head -n 1)
+
+# Helper to check if a port is open
+is_port_open() {
+  local host="$1"
+  local port="$2"
+  (echo > "/dev/tcp/$host/$port") >/dev/null 2>&1
+}
 
 echo "Starting Torchain Gateway..."
 # Kill any existing instances
@@ -95,8 +102,55 @@ killall privoxy 2>/dev/null || true
 
 # Start Tor
 tor -f "$CONF_DIR/torrc" --RunAsDaemon 1
+
+# Wait for Tor ports to open (SOCKS on 9050, DNS on 5400)
+echo "Waiting for Tor to start..."
+tor_ok=0
+for i in {1..30}; do
+  if is_port_open "127.0.0.1" 9050 && is_port_open "127.0.0.1" 5400; then
+    tor_ok=1
+    break
+  fi
+  sleep 0.5
+done
+
+if [ "$tor_ok" -ne 1 ]; then
+  echo "ERROR: Tor failed to start within 15 seconds. Check Tor logs or try running manually: tor -f $CONF_DIR/torrc" >&2
+  killall tor 2>/dev/null || true
+  exit 1
+fi
+
 # Start Privoxy
 privoxy "$CONF_DIR/privoxy.conf"
+
+# Wait for Privoxy port to open (HTTP on 8118)
+echo "Waiting for Privoxy to start..."
+privoxy_ok=0
+for i in {1..10}; do
+  if is_port_open "127.0.0.1" 8118; then
+    privoxy_ok=1
+    break
+  fi
+  sleep 0.5
+done
+
+if [ "$privoxy_ok" -ne 1 ]; then
+  echo "ERROR: Privoxy failed to start. Port 8118 might be in use." >&2
+  killall tor privoxy 2>/dev/null || true
+  exit 1
+fi
+
+# Determine active local IP address dynamically
+LOCAL_IP=""
+if command -v python3 >/dev/null 2>&1; then
+  LOCAL_IP=$(python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('8.8.8.8', 80)); print(s.getsockname()[0]); s.close()" 2>/dev/null)
+fi
+if [ -z "$LOCAL_IP" ]; then
+  LOCAL_IP=$(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -v '127.0.0.1' | head -n 1)
+fi
+if [ -z "$LOCAL_IP" ]; then
+  LOCAL_IP="0.0.0.0"
+fi
 
 echo "=================================================="
 echo " Torchain Gateway is now RUNNING!"

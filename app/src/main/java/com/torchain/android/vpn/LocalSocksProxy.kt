@@ -10,7 +10,9 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -37,9 +39,11 @@ class LocalSocksProxy(
     private val torSocksPort: Int = 9050,
     private val torDnsPort: Int = 5400
 ) {
-    private var serverSocket: ServerSocket? = null
-    private var udpSocket: DatagramSocket? = null
+    @Volatile private var serverSocket: ServerSocket? = null
+    @Volatile private var udpSocket: DatagramSocket? = null
     @Volatile private var running = false
+
+    private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
 
     // Bounded worker pool for SOCKS client handling. Core/max = MAX_CONCURRENT;
     // queue is small so back-pressure rejects floods fast instead of piling up.
@@ -55,11 +59,7 @@ class LocalSocksProxy(
                 priority = Thread.NORM_PRIORITY - 1
             }
         },
-        /* handler         = */ { _, _ ->
-            // Queue saturated — caller-run is not appropriate here; just drop.
-            // The RejectedExecutionHandler receives the Runnable, but we closed
-            // the socket inside the Runnable's wrapper, so nothing to do here.
-        }
+        /* handler         = */ ThreadPoolExecutor.AbortPolicy()
     )
 
     private val pipePool: ThreadPoolExecutor = ThreadPoolExecutor(
@@ -67,18 +67,34 @@ class LocalSocksProxy(
         /* maximumPoolSize = */ MAX_CONCURRENT * 2,
         /* keepAliveTime   = */ 30L,
         /* unit            = */ TimeUnit.SECONDS,
-        /* workQueue       = */ LinkedBlockingQueue(MAX_QUEUE * 2),
+        /* workQueue       = */ SynchronousQueue<Runnable>(),
         /* threadFactory   = */ { r ->
             Thread(r, "socks-pipe-${pipeCounter.incrementAndGet()}").apply {
                 isDaemon = true
                 priority = Thread.NORM_PRIORITY - 1
             }
         },
-        /* handler = */ { _, _ -> }
+        /* handler         = */ ThreadPoolExecutor.AbortPolicy()
+    )
+
+    private val udpPool: ThreadPoolExecutor = ThreadPoolExecutor(
+        /* corePoolSize    = */ 16,
+        /* maximumPoolSize = */ 32,
+        /* keepAliveTime   = */ 30L,
+        /* unit            = */ TimeUnit.SECONDS,
+        /* workQueue       = */ LinkedBlockingQueue(100),
+        /* threadFactory   = */ { r ->
+            Thread(r, "socks-udp-${udpCounter.incrementAndGet()}").apply {
+                isDaemon = true
+                priority = Thread.NORM_PRIORITY - 1
+            }
+        },
+        /* handler         = */ ThreadPoolExecutor.AbortPolicy()
     )
 
     private val workerCounter = AtomicInteger(0)
     private val pipeCounter = AtomicInteger(0)
+    private val udpCounter = AtomicInteger(0)
     private val activeConnections = AtomicInteger(0)
     private val rejectedConnections = AtomicLong(0)
 
@@ -101,14 +117,29 @@ class LocalSocksProxy(
         }
     }
 
+    private fun closeSocket(socket: Socket?) {
+        if (socket != null) {
+            activeSockets.remove(socket)
+            try { socket.close() } catch (_: Exception) {}
+        }
+    }
+
     fun stop() {
         running = false
         try { serverSocket?.close() } catch (_: Exception) {}
         try { udpSocket?.close() } catch (_: Exception) {}
         serverSocket = null
         udpSocket = null
+
+        val socketsToClose = activeSockets.toList()
+        activeSockets.clear()
+        for (s in socketsToClose) {
+            try { s.close() } catch (_: Exception) {}
+        }
+
         try { workerPool.shutdownNow() } catch (_: Exception) {}
         try { pipePool.shutdownNow() } catch (_: Exception) {}
+        try { udpPool.shutdownNow() } catch (_: Exception) {}
         Logger.i("LocalSocksProxy", "Local SOCKS proxy stopped (served=${activeConnections.get()}, rejected=${rejectedConnections.get()})")
     }
 
@@ -117,27 +148,34 @@ class LocalSocksProxy(
             try {
                 val client = serverSocket?.accept() ?: break
                 client.tcpNoDelay = true
-                // Submit to the bounded pool. If the pool+queue are saturated we
-                // close the socket immediately instead of spawning yet another
-                // thread — this is what prevents the OOM crash under flood.
+                activeSockets.add(client)
+
+                val currentActive = activeConnections.incrementAndGet()
+                if (currentActive > MAX_CONCURRENT) {
+                    rejectedConnections.incrementAndGet()
+                    activeConnections.decrementAndGet()
+                    closeSocket(client)
+                    continue
+                }
+
                 try {
                     workerPool.execute {
+                        var handedOver = false
                         try {
-                            if (activeConnections.incrementAndGet() <= MAX_CONCURRENT * 2) {
-                                handleTcpClient(client)
-                            } else {
-                                rejectedConnections.incrementAndGet()
-                                try { client.close() } catch (_: Exception) {}
-                            }
+                            handedOver = handleTcpClient(client)
                         } catch (e: Throwable) {
                             Logger.w("LocalSocksProxy", "Worker threw: ${e.message}")
                         } finally {
-                            activeConnections.decrementAndGet()
+                            if (!handedOver) {
+                                closeSocket(client)
+                                activeConnections.decrementAndGet()
+                            }
                         }
                     }
                 } catch (rejected: java.util.concurrent.RejectedExecutionException) {
                     rejectedConnections.incrementAndGet()
-                    try { client.close() } catch (_: Exception) {}
+                    activeConnections.decrementAndGet()
+                    closeSocket(client)
                 }
             } catch (e: Exception) {
                 if (running) {
@@ -147,7 +185,7 @@ class LocalSocksProxy(
         }
     }
 
-    private fun handleTcpClient(client: Socket) {
+    private fun handleTcpClient(client: Socket): Boolean {
         try {
             client.soTimeout = 30000
             val input = client.getInputStream()
@@ -156,13 +194,11 @@ class LocalSocksProxy(
             // 1. Handshake
             val version = input.read()
             if (version != 5) {
-                client.close()
-                return
+                return false
             }
             val nMethods = input.read()
             if (nMethods <= 0) {
-                client.close()
-                return
+                return false
             }
             val methods = ByteArray(nMethods)
             input.readFully(methods)
@@ -179,8 +215,7 @@ class LocalSocksProxy(
 
             if (reqVersion != 5) {
                 sendErrorResponse(output, 0x01) // general failure
-                client.close()
-                return
+                return false
             }
 
             // Parse destination address — keep the RAW address bytes (not just the
@@ -202,8 +237,7 @@ class LocalSocksProxy(
                     val len = input.read()
                     if (len <= 0) {
                         sendErrorResponse(output, 0x01)
-                        client.close()
-                        return
+                        return false
                     }
                     val domainBytes = ByteArray(len)
                     input.readFully(domainBytes)
@@ -221,8 +255,7 @@ class LocalSocksProxy(
                 }
                 else -> {
                     sendErrorResponse(output, 0x08) // Address type not supported
-                    client.close()
-                    return
+                    return false
                 }
             }
 
@@ -231,16 +264,17 @@ class LocalSocksProxy(
             val destPort = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
 
             if (cmd == 0x01) { // CONNECT
-                val torSocket = try {
-                    Socket().apply {
-                        tcpNoDelay = true
-                        connect(InetSocketAddress("127.0.0.1", torSocksPort), 5000)
-                    }
+                var torSocket: Socket? = null
+                try {
+                    torSocket = Socket()
+                    torSocket.tcpNoDelay = true
+                    activeSockets.add(torSocket)
+                    torSocket.connect(InetSocketAddress("127.0.0.1", torSocksPort), 5000)
                 } catch (e: Exception) {
                     Logger.w("LocalSocksProxy", "Tor SOCKS connect failed: ${e.message}")
                     sendErrorResponse(output, 0x03) // Network unreachable
-                    client.close()
-                    return
+                    closeSocket(torSocket)
+                    return false
                 }
 
                 val tOut = torSocket.getOutputStream()
@@ -253,7 +287,8 @@ class LocalSocksProxy(
                     val g2 = tIn.read()
                     if (g1 != 5 || g2 == 0xFF || g2 == -1) {
                         sendErrorResponse(output, 0x01) // general SOCKS server failure
-                        torSocket.close(); client.close(); return
+                        closeSocket(torSocket)
+                        return false
                     }
                     // CONNECT request: replay ATYP + addr + port to Tor verbatim.
                     val req = java.io.ByteArrayOutputStream()
@@ -276,12 +311,14 @@ class LocalSocksProxy(
                     if (repCode != 0x00) {
                         Logger.w("LocalSocksProxy", "Tor rejected CONNECT $destAddrLog:$destPort rep=$repCode")
                         sendErrorResponse(output, repCode.toByte())
-                        torSocket.close(); client.close(); return
+                        closeSocket(torSocket)
+                        return false
                     }
                 } catch (e: Exception) {
                     Logger.w("LocalSocksProxy", "Tor SOCKS5 handshake failed: ${e.message}")
                     sendErrorResponse(output, 0x01)
-                    torSocket.close(); client.close(); return
+                    closeSocket(torSocket)
+                    return false
                 }
 
                 // Tor accepted the CONNECT — now tell the client (TProxy) success
@@ -293,6 +330,7 @@ class LocalSocksProxy(
 
                 // Pipe bi-directionally on the bounded pipe pool.
                 pipeSockets(client, torSocket)
+                return true
 
             } else if (cmd == 0x03) { // UDP ASSOCIATE
                 val localUdpPort = udpSocket?.localPort ?: 0
@@ -315,14 +353,14 @@ class LocalSocksProxy(
                         if (read < 0) break
                     }
                 } catch (_: Exception) {}
-                client.close()
+                return false
             } else {
                 sendErrorResponse(output, 0x07) // Command not supported
-                client.close()
+                return false
             }
         } catch (e: Exception) {
             Logger.w("LocalSocksProxy", "Error handling TCP client: ${e.message}")
-            try { client.close() } catch (_: Exception) {}
+            return false
         }
     }
 
@@ -343,31 +381,66 @@ class LocalSocksProxy(
     }
 
     private fun pipeSockets(s1: Socket, s2: Socket) {
-        pipePool.execute {
-            try {
-                val in1 = s1.getInputStream()
-                val out2 = s2.getOutputStream()
-                val buf = ByteArray(8192)
-                var len: Int
-                while (in1.read(buf).also { len = it } >= 0) {
-                    if (len > 0) { out2.write(buf, 0, len); out2.flush() }
-                }
-            } catch (_: Exception) {}
-            try { s2.shutdownOutput() } catch (_: Exception) {}
-            try { s1.close() } catch (_: Exception) {}
+        val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val pipesFinished = AtomicInteger(2)
+
+        fun closeAll() {
+            if (closed.compareAndSet(false, true)) {
+                closeSocket(s1)
+                closeSocket(s2)
+            }
         }
-        pipePool.execute {
-            try {
-                val in2 = s2.getInputStream()
-                val out1 = s1.getOutputStream()
-                val buf = ByteArray(8192)
-                var len: Int
-                while (in2.read(buf).also { len = it } >= 0) {
-                    if (len > 0) { out1.write(buf, 0, len); out1.flush() }
+
+        fun onPipeDone() {
+            if (pipesFinished.decrementAndGet() == 0) {
+                activeConnections.decrementAndGet()
+            }
+        }
+
+        try {
+            pipePool.execute {
+                try {
+                    val in1 = s1.getInputStream()
+                    val out2 = s2.getOutputStream()
+                    val buf = ByteArray(8192)
+                    var len: Int
+                    while (in1.read(buf).also { len = it } >= 0) {
+                        if (len > 0) { out2.write(buf, 0, len); out2.flush() }
+                    }
+                } catch (_: Exception) {}
+                finally {
+                    try { s2.shutdownOutput() } catch (_: Exception) {}
+                    closeAll()
+                    onPipeDone()
                 }
-            } catch (_: Exception) {}
-            try { s1.shutdownOutput() } catch (_: Exception) {}
-            try { s2.close() } catch (_: Exception) {}
+            }
+        } catch (rejected: Exception) {
+            closeAll()
+            onPipeDone()
+            onPipeDone()
+            return
+        }
+
+        try {
+            pipePool.execute {
+                try {
+                    val in2 = s2.getInputStream()
+                    val out1 = s1.getOutputStream()
+                    val buf = ByteArray(8192)
+                    var len: Int
+                    while (in2.read(buf).also { len = it } >= 0) {
+                        if (len > 0) { out1.write(buf, 0, len); out1.flush() }
+                    }
+                } catch (_: Exception) {}
+                finally {
+                    try { s1.shutdownOutput() } catch (_: Exception) {}
+                    closeAll()
+                    onPipeDone()
+                }
+            }
+        } catch (rejected: Exception) {
+            closeAll()
+            onPipeDone()
         }
     }
 
@@ -383,8 +456,12 @@ class LocalSocksProxy(
                 val clientAddress = packet.address
                 val clientPort = packet.port
 
-                thread(name = "socks-udp-packet") {
-                    handleUdpPacket(packetData, clientAddress, clientPort)
+                try {
+                    udpPool.execute {
+                        handleUdpPacket(packetData, clientAddress, clientPort)
+                    }
+                } catch (rejected: java.util.concurrent.RejectedExecutionException) {
+                    Logger.w("LocalSocksProxy", "UDP packet dropped due to pool saturation")
                 }
             } catch (e: Exception) {
                 if (running) {
@@ -396,7 +473,7 @@ class LocalSocksProxy(
 
     private fun handleUdpPacket(data: ByteArray, clientAddress: InetAddress, clientPort: Int) {
         try {
-            if (data.size < 10) return
+            if (data.size < 4) return
             // Parse SOCKS5 UDP header
             val frag = data[2]
             val atyp = data[3]
@@ -407,18 +484,23 @@ class LocalSocksProxy(
             var headerLen = 4
             when (atyp.toInt()) {
                 0x01 -> { // IPv4
+                    if (data.size < headerLen + 4) return
                     headerLen += 4
                 }
                 0x03 -> { // Domain
+                    if (data.size < headerLen + 1) return
                     val len = data[headerLen].toInt() and 0xFF
+                    if (data.size < headerLen + 1 + len) return
                     headerLen += 1 + len
                 }
                 0x04 -> { // IPv6
+                    if (data.size < headerLen + 16) return
                     headerLen += 16
                 }
                 else -> return
             }
 
+            if (data.size < headerLen + 2) return
             val destPort = ((data[headerLen].toInt() and 0xFF) shl 8) or (data[headerLen + 1].toInt() and 0xFF)
             headerLen += 2
 
@@ -446,8 +528,8 @@ class LocalSocksProxy(
 
     private fun queryTorDns(query: ByteArray): ByteArray? {
         return try {
-            DatagramSocket().use { socket ->
-                socket.soTimeout = 8000
+            DatagramSocket(InetSocketAddress("127.0.0.1", 0)).use { socket ->
+                socket.soTimeout = 2500
                 val torAddr = InetAddress.getByName("127.0.0.1")
                 val packet = DatagramPacket(query, query.size, torAddr, torDnsPort)
                 socket.send(packet)

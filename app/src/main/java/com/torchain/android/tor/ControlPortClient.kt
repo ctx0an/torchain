@@ -2,6 +2,8 @@ package com.torchain.android.tor
 
 import com.torchain.android.util.Logger
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.IOException
@@ -20,10 +22,11 @@ class ControlPortClient(
     private val port: Int = 9051,
     private val cookieFile: java.io.File? = null
 ) {
-    private var sock: Socket? = null
-    private var writer: OutputStreamWriter? = null
-    private var reader: BufferedReader? = null
-    private var listenerThread: Thread? = null
+    private val mutex = Mutex()
+    @Volatile private var sock: Socket? = null
+    @Volatile private var writer: OutputStreamWriter? = null
+    @Volatile private var reader: BufferedReader? = null
+    @Volatile private var listenerThread: Thread? = null
     private var eventListener: ((Event) -> Unit)? = null
     @Volatile private var running = false
     private val replyQueue = LinkedBlockingQueue<String>()
@@ -46,15 +49,29 @@ class ControlPortClient(
     fun setEventListener(l: (Event) -> Unit) { eventListener = l }
 
     suspend fun connect() = withContext(Dispatchers.IO) {
-        val s = Socket()
-        s.connect(InetSocketAddress(host, port), 5000)
-        s.keepAlive = true
-        sock = s
-        writer = OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8)
-        reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
-        running = true
-        authenticate()
-        startReader()
+        mutex.withLock {
+            val s = Socket()
+            try {
+                s.connect(InetSocketAddress(host, port), 5000)
+                s.keepAlive = true
+                sock = s
+                writer = OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8)
+                reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
+                replyQueue.clear()
+                running = true
+                authenticate()
+                startReader()
+            } catch (e: Exception) {
+                running = false
+                try { writer?.close() } catch (_: Exception) {}
+                try { reader?.close() } catch (_: Exception) {}
+                try { s.close() } catch (_: Exception) {}
+                writer = null
+                reader = null
+                sock = null
+                throw e
+            }
+        }
     }
 
     private fun authenticate() {
@@ -114,7 +131,55 @@ class ControlPortClient(
             }
         } catch (e: Exception) {
             if (running) Logger.w("tor-ctl", "reader loop ended", e)
+        } finally {
+            replyQueue.offer(SHUTDOWN_SENTINEL)
         }
+    }
+
+    private fun splitArguments(s: String): List<String> {
+        val tokens = mutableListOf<String>()
+        val current = StringBuilder()
+        var inQuotes = false
+        var escaped = false
+        for (ch in s) {
+            if (escaped) {
+                current.append(ch)
+                escaped = false
+            } else if (ch == '\\') {
+                escaped = true
+            } else if (ch == '"') {
+                inQuotes = !inQuotes
+                current.append(ch)
+            } else if (ch.isWhitespace() && !inQuotes) {
+                if (current.isNotEmpty()) {
+                    tokens.add(current.toString())
+                    current.clear()
+                }
+            } else {
+                current.append(ch)
+            }
+        }
+        if (current.isNotEmpty()) {
+            tokens.add(current.toString())
+        }
+        return tokens
+    }
+
+    private fun parseKv(tokens: List<String>): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for (t in tokens) {
+            val eq = t.indexOf('=')
+            if (eq > 0) {
+                val key = t.substring(0, eq)
+                var value = t.substring(eq + 1)
+                if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+                    value = value.substring(1, value.length - 1)
+                }
+                value = value.replace("\\\"", "\"").replace("\\\\", "\\")
+                out[key] = value
+            }
+        }
+        return out
     }
 
     private fun parseAsyncLine(line: String): Event? {
@@ -123,18 +188,10 @@ class ControlPortClient(
         return when {
             body.startsWith("STATUS_CLIENT ") || body.startsWith("STATUS_GENERAL ") ||
             body.startsWith("STATUS_BOOTSTRAP ") -> {
-                // Tor control spec: 650 STATUS_CLIENT <Severity> <Action> <Args...>
-                // e.g. 650 STATUS_CLIENT NOTICE BOOTSTRAP PROGRESS=5 TAG=conn SUMMARY="..."
-                // parts = [<Severity>, <Action>, <arg>, ...]
-                // The previous code read `action = parts.firstOrNull()` which is the
-                // SEVERITY ("NOTICE"), so the `action == "BOOTSTRAP"` check was always
-                // false and every bootstrap event was misclassified as a Status event.
-                // That left the dashboard stuck at "Bootstrap 0%" and (with the
-                // VPN-waits-for-Running fix) the VPN never came up.
-                val parts = body.split(' ').drop(1)
+                val parts = splitArguments(body).drop(1)
                 val severity = parts.firstOrNull() ?: ""
                 val action = parts.getOrNull(1) ?: ""
-                val kv = parseKv(parts.drop(2).joinToString(" "))
+                val kv = parseKv(parts.drop(2))
                 if (action == "BOOTSTRAP") {
                     Event.Bootstrap((kv["PROGRESS"] ?: "0").toIntOrNull() ?: 0, kv["TAG"] ?: "")
                 } else {
@@ -142,11 +199,11 @@ class ControlPortClient(
                 }
             }
             body.startsWith("BW ") -> {
-                val p = body.removePrefix("BW ").split(' ')
+                val p = splitArguments(body.removePrefix("BW "))
                 Event.Bandwidth(p.getOrNull(0)?.toLongOrNull() ?: 0, p.getOrNull(1)?.toLongOrNull() ?: 0)
             }
             body.startsWith("CIRC ") -> {
-                val tokens = body.removePrefix("CIRC ").split(' ')
+                val tokens = splitArguments(body.removePrefix("CIRC "))
                 val cid = tokens.getOrNull(0) ?: ""
                 val cstatus = tokens.getOrNull(1) ?: ""
                 val meta = mutableMapOf<String, String>()
@@ -155,7 +212,13 @@ class ControlPortClient(
                     val t = tokens[i]
                     if (t.contains('=') && t[0].isUpperCase()) {
                         val eq = t.indexOf('=')
-                        meta[t.substring(0, eq)] = t.substring(eq + 1)
+                        val key = t.substring(0, eq)
+                        var value = t.substring(eq + 1)
+                        if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+                            value = value.substring(1, value.length - 1)
+                        }
+                        value = value.replace("\\\"", "\"").replace("\\\\", "\\")
+                        meta[key] = value
                     } else {
                         pathParts.add(t)
                     }
@@ -177,44 +240,89 @@ class ControlPortClient(
         }
     }
 
-    private fun parseKv(s: String): Map<String, String> {
-        val out = LinkedHashMap<String, String>()
-        Regex("(\\w+)=(\\S+)").findAll(s).forEach { out[it.groupValues[1]] = it.groupValues[2] }
-        return out
-    }
-
-    suspend fun setEvents(vararg events: String) {
-        send("SETEVENTS ${events.joinToString(" ")}"); readReply()
+    suspend fun setEvents(vararg events: String) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            send("SETEVENTS ${events.joinToString(" ")}")
+            readReply()
+        }
     }
 
     suspend fun getInfo(vararg keys: String): Map<String, String> = withContext(Dispatchers.IO) {
-        send("GETINFO ${keys.joinToString(" ")}")
-        val replies = readReply()
-        val out = LinkedHashMap<String, String>()
-        replies.forEach { line ->
-            if (line.startsWith("250-") || line.startsWith("250+")) {
-                val body = line.removePrefix("250-").removePrefix("250+")
-                val eq = body.indexOf('=')
-                if (eq > 0) out[body.substring(0, eq)] = body.substring(eq + 1)
+        mutex.withLock {
+            send("GETINFO ${keys.joinToString(" ")}")
+            val replies = readReply()
+            val out = LinkedHashMap<String, String>()
+            var currentKey: String? = null
+            val currentValue = StringBuilder()
+
+            for (line in replies) {
+                if (currentKey != null) {
+                    if (line == ".") {
+                        out[currentKey] = currentValue.toString().trimEnd('\n')
+                        currentKey = null
+                        currentValue.clear()
+                    } else {
+                        val unescapedLine = if (line.startsWith("..")) line.substring(1) else line
+                        currentValue.append(unescapedLine).append('\n')
+                    }
+                } else {
+                    if (line.startsWith("250+")) {
+                        val body = line.substring(4)
+                        val eq = body.indexOf('=')
+                        if (eq > 0) {
+                            currentKey = body.substring(0, eq)
+                            currentValue.clear()
+                        }
+                    } else if (line.startsWith("250-")) {
+                        val body = line.substring(4)
+                        val eq = body.indexOf('=')
+                        if (eq > 0) {
+                            out[body.substring(0, eq)] = body.substring(eq + 1)
+                        }
+                    } else if (line.startsWith("250 ")) {
+                        val body = line.substring(4)
+                        if (body != "OK") {
+                            val eq = body.indexOf('=')
+                            if (eq > 0) {
+                                out[body.substring(0, eq)] = body.substring(eq + 1)
+                            }
+                        }
+                    }
+                }
             }
+            out
         }
-        out
     }
 
-    suspend fun setConf(vararg pairs: Pair<String, String>) {
-        val s = pairs.joinToString(" ") { (k, v) ->
-            "$k=${if (v.contains(' ') || v.isEmpty()) "\"$v\"" else v}"
+    suspend fun setConf(vararg pairs: Pair<String, String>) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            val s = pairs.joinToString(" ") { (k, v) ->
+                "$k=${if (v.contains(' ') || v.isEmpty()) "\"$v\"" else v}"
+            }
+            send("SETCONF $s")
+            readReply()
         }
-        send("SETCONF $s"); readReply()
     }
 
-    suspend fun signal(sig: String) { send("SIGNAL $sig"); readReply() }
+    suspend fun signal(sig: String) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            send("SIGNAL $sig")
+            readReply()
+        }
+    }
 
     suspend fun close() = withContext(Dispatchers.IO) {
         running = false
         try { send("QUIT") } catch (_: Exception) {}
+        try { writer?.close() } catch (_: Exception) {}
+        try { reader?.close() } catch (_: Exception) {}
         try { sock?.close() } catch (_: Exception) {}
+        replyQueue.offer(SHUTDOWN_SENTINEL)
         try { listenerThread?.join(500) } catch (_: Exception) {}
+        writer = null
+        reader = null
+        sock = null
+        listenerThread = null
     }
 
     private fun send(line: String) {
@@ -228,6 +336,10 @@ class ControlPortClient(
         while (true) {
             val line = replyQueue.poll(20, TimeUnit.SECONDS)
                 ?: throw IOException("control port reply timeout")
+            if (line == SHUTDOWN_SENTINEL) {
+                replyQueue.offer(SHUTDOWN_SENTINEL)
+                throw IOException("Control port disconnected")
+            }
             out.add(line)
             if (line.length >= 4 && line[3] == ' ') break
         }
@@ -271,6 +383,7 @@ class ControlPortClient(
     }
 
     companion object {
+        private const val SHUTDOWN_SENTINEL = "\u0000_SHUTDOWN_\u0000"
         private const val SERVER_TO_CONTROLLER_KEY =
             "Tor safe cookie authentication server-to-controller hash"
         private const val CONTROLLER_TO_SERVER_KEY =

@@ -1,6 +1,3 @@
-import java.net.URL
-import java.net.URLClassLoader
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -68,7 +65,6 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.7.7")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation("org.json:json:20240303")
     implementation("com.netzarchitekten:IPtProxy:3.8.2")
 }
 
